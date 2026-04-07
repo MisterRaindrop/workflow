@@ -1,0 +1,34 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax check
+        run: bash -n wk
+
+      - name: Install shellcheck
+        run: |
+          if [[ "$(uname)" == "Darwin" ]]; then
+            brew install shellcheck
+          else
+            sudo apt-get update && sudo apt-get install -y shellcheck
+          fi
+
+      - name: Shellcheck
+        run: shellcheck -x wk test.sh install.sh || true
+
+      - name: Run tests
+        run: bash test.sh
