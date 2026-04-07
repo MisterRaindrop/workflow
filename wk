@@ -1,0 +1,721 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- Colors & helpers ---
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
+CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+
+die()  { printf "${RED}error:${RESET} %s\n" "$*" >&2; exit 1; }
+warn() { printf "${YELLOW}warn:${RESET} %s\n" "$*" >&2; }
+info() { printf "${GREEN}=>${RESET} %s\n" "$*"; }
+
+# --- Repo detection ---
+find_repo_root() {
+    local dir="$PWD"
+    while [[ "$dir" != "/" ]]; do
+        [[ -f "$dir/.wk.yaml" ]] && { echo "$dir"; return; }
+        dir="$(dirname "$dir")"
+    done
+    die "not inside a wk-managed repo (no .wk.yaml found)"
+}
+
+# REPO_ROOT is set lazily — see require_repo()
+REPO_ROOT=""
+
+require_repo() {
+    [[ -n "$REPO_ROOT" ]] && return
+    REPO_ROOT="$(find_repo_root)"
+}
+
+# --- YAML helper (requires yq) ---
+yaml_get() { require_repo; yq eval "$1" "$REPO_ROOT/.wk.yaml" 2>/dev/null; }
+
+# --- Branch / worktree helpers ---
+sanitize_branch() { echo "$1" | tr '/' '-' | tr '[:upper:]' '[:lower:]'; }
+
+ssh_port_for() {
+    local hash
+    hash=$(echo -n "$1" | cksum | awk '{print $1}')
+    echo $(( 10000 + hash % 9000 ))
+}
+
+compose_file_for() { echo "$1/.wk/docker-compose.yml"; }
+
+container_name_for() { echo "lightning-$(sanitize_branch "$1")"; }
+
+# Resolve branch from pr:NNN or plain name
+resolve_branch() {
+    local arg="$1"
+    if [[ "$arg" == pr:* ]]; then
+        local pr_num="${arg#pr:}"
+        gh pr view "$pr_num" --json headRefName -q '.headRefName' \
+            || die "cannot resolve PR #$pr_num"
+    else
+        echo "$arg"
+    fi
+}
+
+# Get worktree path for a branch
+worktree_path_for() {
+    local branch="$1"
+    local sanitized
+    sanitized="$(sanitize_branch "$branch")"
+    local repo_name
+    repo_name="$(basename "$REPO_ROOT")"
+    local tmpl
+    tmpl="$(yaml_get '.path // ""')"
+    if [[ -n "$tmpl" && "$tmpl" != "null" ]]; then
+        echo "$tmpl" \
+            | sed "s|{{ *repo_path *}}|$REPO_ROOT|g" \
+            | sed "s|{{ *repo *}}|$repo_name|g" \
+            | sed "s|{{ *branch *| *sanitize *}}|$sanitized|g" \
+            | sed "s|{{ *branch *}}|$sanitized|g"
+    else
+        echo "$REPO_ROOT/../${repo_name}-${sanitized}"
+    fi
+}
+
+# Detect current worktree branch (if pwd is inside one)
+current_worktree_branch() {
+    local wt_path
+    wt_path="$(git -C "$REPO_ROOT" worktree list --porcelain | awk '
+        /^worktree / { path=$2 }
+        /^branch /   { branch=$2; print path " " branch }
+    ')"
+    local cwd="$PWD"
+    while IFS=' ' read -r path branch; do
+        [[ "$path" == "$REPO_ROOT" ]] && continue
+        if [[ "$cwd" == "$path"* ]]; then
+            echo "${branch#refs/heads/}"
+            return
+        fi
+    done <<< "$wt_path"
+    return 1
+}
+
+# List all wk-managed worktrees (those with .wk/ directory)
+list_wk_worktrees() {
+    git -C "$REPO_ROOT" worktree list --porcelain | awk '
+        /^worktree / { path=$2 }
+        /^branch /   { branch=$2; print path " " branch }
+    ' | while IFS=' ' read -r path branch; do
+        [[ "$path" == "$REPO_ROOT" ]] && continue
+        [[ -d "$path/.wk" ]] || continue
+        echo "${branch#refs/heads/} $path"
+    done
+}
+
+# Select a branch via fzf (from wk-managed worktrees)
+select_branch_fzf() {
+    local prompt="${1:-select branch}"
+    local branches
+    branches="$(list_wk_worktrees | awk '{print $1}')"
+    [[ -z "$branches" ]] && die "no wk-managed worktrees found"
+    echo "$branches" | fzf --prompt="$prompt> " --height=10 --reverse \
+        || die "no branch selected"
+}
+
+# --- Container operations ---
+compose_cmd() {
+    local wt_path="$1"; shift
+    local cf
+    cf="$(compose_file_for "$wt_path")"
+    [[ -f "$cf" ]] || die "compose file not found: $cf"
+    docker compose -f "$cf" "$@"
+}
+
+container_status() {
+    local wt_path="$1"
+    local cf
+    cf="$(compose_file_for "$wt_path")"
+    [[ -f "$cf" ]] || { echo "no-compose"; return; }
+    local state
+    state="$(docker compose -f "$cf" ps --status running --format '{{.State}}' 2>/dev/null | head -1)"
+    if [[ -n "$state" ]]; then
+        echo "$state"
+        return
+    fi
+    state="$(docker compose -f "$cf" ps -a --format '{{.State}}' 2>/dev/null | head -1)"
+    echo "${state:-stopped}"
+}
+
+ensure_running() {
+    local wt_path="$1"
+    local status
+    status="$(container_status "$wt_path")"
+    case "$status" in
+        running) return ;;
+        paused)
+            info "unpausing container..."
+            compose_cmd "$wt_path" unpause
+            ;;
+        stopped|exited|created)
+            info "starting container..."
+            compose_cmd "$wt_path" start
+            ;;
+        no-compose)
+            die "no .wk/docker-compose.yml in $wt_path"
+            ;;
+        *)
+            info "container status: $status, trying start..."
+            compose_cmd "$wt_path" up -d
+            ;;
+    esac
+}
+
+wait_ssh_ready() {
+    local port="$1" max_wait=30 i=0
+    info "waiting for SSH on port $port..."
+    while (( i < max_wait )); do
+        if ssh -o ConnectTimeout=1 -o StrictHostKeyChecking=no -o BatchMode=yes \
+               -p "$port" root@localhost true 2>/dev/null; then
+            return 0
+        fi
+        sleep 1
+        (( i++ ))
+    done
+    warn "SSH not ready after ${max_wait}s, attempting connection anyway"
+}
+
+touch_active() {
+    local wt_path="$1"
+    mkdir -p "$wt_path/.wk"
+    touch "$wt_path/.wk/last-active"
+}
+
+get_ssh_port_from_compose() {
+    local wt_path="$1"
+    local cf
+    cf="$(compose_file_for "$wt_path")"
+    [[ -f "$cf" ]] || return 1
+    sed -n 's/.*"\([0-9]*\):22".*/\1/p' "$cf" 2>/dev/null || echo "?"
+}
+
+# --- Commands ---
+
+cmd_new() {
+    local branch="" copy_cache=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --copy-cache) copy_cache=true; shift ;;
+            *) branch="$1"; shift ;;
+        esac
+    done
+    [[ -z "$branch" ]] && die "usage: wk new <branch|pr:NNN> [--copy-cache]"
+
+    branch="$(resolve_branch "$branch")"
+    local sanitized wt_path
+    sanitized="$(sanitize_branch "$branch")"
+    wt_path="$(worktree_path_for "$branch")"
+    wt_path="$(cd "$REPO_ROOT" && cd "$(dirname "$wt_path")" && echo "$PWD/$(basename "$wt_path")")"
+
+    info "branch: $branch"
+    info "worktree: $wt_path"
+
+    # Create worktree
+    if [[ -d "$wt_path" ]]; then
+        warn "worktree path already exists: $wt_path"
+    else
+        if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+            info "checking out existing branch..."
+            git -C "$REPO_ROOT" worktree add "$wt_path" "$branch"
+        elif git -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/$branch" 2>/dev/null; then
+            info "checking out remote branch..."
+            git -C "$REPO_ROOT" worktree add "$wt_path" -b "$branch" "origin/$branch"
+        else
+            info "creating new branch..."
+            git -C "$REPO_ROOT" worktree add "$wt_path" -b "$branch"
+        fi
+    fi
+
+    # Submodule update
+    info "initializing submodules..."
+    git -C "$wt_path" submodule update --init
+
+    # .wk directory
+    mkdir -p "$wt_path/.wk"
+
+    # Copy and modify docker-compose.yml
+    local src_compose="$REPO_ROOT/docker-compose.yml"
+    local dst_compose="$wt_path/.wk/docker-compose.yml"
+    [[ -f "$src_compose" ]] || die "docker-compose.yml not found in repo root"
+
+    local container_name port
+    container_name="$(container_name_for "$branch")"
+    port="$(ssh_port_for "$branch")"
+
+    info "container: $container_name, SSH port: $port"
+
+    cp "$src_compose" "$dst_compose"
+    # Replace compose project name
+    sed -i '' "s/^name: .*/name: $container_name/" "$dst_compose"
+    # Replace hostname
+    sed -i '' "s/hostname: .*/hostname: $sanitized/" "$dst_compose"
+    # Replace SSH port
+    sed -i '' "s/\"[0-9]*:22\"/\"$port:22\"/" "$dst_compose"
+    # Fix volumes: .:/workspace/ → wt_path:/workspace/
+    sed -i '' "s|- \.:/workspace/|- $wt_path:/workspace/|" "$dst_compose"
+    # Fix volumes: .cache/ → wt_path/.cache/
+    sed -i '' "s|- \.cache/:/cache/|- $wt_path/.cache/:/cache/|" "$dst_compose"
+
+    # Copy cache if requested
+    if $copy_cache && [[ -d "$REPO_ROOT/.cache" ]]; then
+        info "copying .cache from main worktree..."
+        mkdir -p "$wt_path/.cache"
+        cp -r "$REPO_ROOT/.cache/"* "$wt_path/.cache/" 2>/dev/null || true
+    fi
+
+    # Start container
+    info "starting container..."
+    docker compose -f "$dst_compose" up -d
+
+    # Checkout database submodule to same-named branch if it exists
+    if [[ -d "$wt_path/database" ]]; then
+        local db_remote_branch
+        db_remote_branch="$(git -C "$wt_path/database" ls-remote --heads origin "$branch" 2>/dev/null || true)"
+        if [[ -n "$db_remote_branch" ]]; then
+            info "checking out database/ to branch $branch..."
+            git -C "$wt_path/database" fetch origin "$branch"
+            git -C "$wt_path/database" checkout -B "$branch" "origin/$branch"
+        fi
+    fi
+
+    touch_active "$wt_path"
+
+    echo ""
+    info "done! To enter the worktree:"
+    printf "  ${CYAN}cd %s${RESET}\n" "$wt_path"
+    printf "  ${CYAN}wk ssh${RESET}\n"
+
+    # Output for shell integration (auto-cd)
+    if [[ "${WK_SHELL_INTEGRATION:-}" == "1" ]]; then
+        echo "__wk_cd:$wt_path"
+    fi
+}
+
+cmd_rm() {
+    local force=false branch=""
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -f|--force) force=true; shift ;;
+            *) branch="$1"; shift ;;
+        esac
+    done
+
+    if [[ -z "$branch" ]]; then
+        branch="$(select_branch_fzf "remove")"
+    fi
+
+    local wt_path=""
+    while IFS=' ' read -r b p; do
+        [[ "$b" == "$branch" ]] && { wt_path="$p"; break; }
+    done < <(list_wk_worktrees)
+
+    [[ -z "$wt_path" ]] && die "worktree not found for branch: $branch"
+
+    # Safety check
+    if ! $force; then
+        local dirty=""
+        dirty="$(git -C "$wt_path" status --porcelain 2>/dev/null || true)"
+        if [[ -d "$wt_path/database" ]]; then
+            dirty+="$(git -C "$wt_path/database" status --porcelain 2>/dev/null || true)"
+        fi
+        if [[ -n "$dirty" ]]; then
+            warn "uncommitted changes in $branch:"
+            echo "$dirty" | head -20
+            die "use 'wk rm -f $branch' to force remove"
+        fi
+    fi
+
+    # Stop container
+    local cf
+    cf="$(compose_file_for "$wt_path")"
+    if [[ -f "$cf" ]]; then
+        info "stopping container..."
+        docker compose -f "$cf" down 2>/dev/null || true
+    fi
+
+    # Remove worktree
+    info "removing worktree..."
+    git -C "$REPO_ROOT" worktree remove "$wt_path" ${force:+--force} 2>/dev/null || {
+        if $force; then
+            warn "git worktree remove failed, removing directory..."
+            rm -rf "$wt_path"
+            git -C "$REPO_ROOT" worktree prune
+        else
+            die "failed to remove worktree (use -f to force)"
+        fi
+    }
+
+    info "removed: $branch"
+}
+
+cmd_ls() {
+    printf "${BOLD}%-20s %-30s %-10s %-6s %-6s %-4s %s${RESET}\n" \
+        "BRANCH" "CONTAINER" "STATUS" "SSH" "IDLE" "CI" "NOTE"
+
+    while IFS=' ' read -r branch wt_path; do
+        [[ -z "$branch" ]] && continue
+
+        local container_name status port idle ci note
+
+        container_name="$(container_name_for "$branch")"
+        status="$(container_status "$wt_path")"
+        port="$(get_ssh_port_from_compose "$wt_path")"
+
+        # Idle time
+        if [[ -f "$wt_path/.wk/last-active" ]]; then
+            local now last_active diff
+            now="$(date +%s)"
+            last_active="$(stat -f %m "$wt_path/.wk/last-active" 2>/dev/null || stat -c %Y "$wt_path/.wk/last-active" 2>/dev/null || echo "$now")"
+            diff=$(( now - last_active ))
+            if (( diff < 60 )); then
+                idle="${diff}s"
+            elif (( diff < 3600 )); then
+                idle="$(( diff / 60 ))m"
+            elif (( diff < 86400 )); then
+                idle="$(( diff / 3600 ))h"
+            else
+                idle="$(( diff / 86400 ))d"
+            fi
+        else
+            idle="-"
+        fi
+
+        # CI status (best effort, don't block on errors)
+        ci="-"
+        if command -v gh &>/dev/null; then
+            local ci_result
+            ci_result="$(gh run list --branch "$branch" --limit 1 --json conclusion -q '.[0].conclusion' 2>/dev/null || true)"
+            case "$ci_result" in
+                success)  ci="✓" ;;
+                failure)  ci="✗" ;;
+                *)        ci="-" ;;
+            esac
+        fi
+
+        # Note from vars
+        note=""
+        if [[ -f "$wt_path/.wk/vars" ]]; then
+            note="$(grep '^note=' "$wt_path/.wk/vars" 2>/dev/null | cut -d= -f2- || true)"
+        fi
+
+        # Color status
+        local status_colored
+        case "$status" in
+            running) status_colored="${GREEN}${status}${RESET}" ;;
+            paused)  status_colored="${YELLOW}${status}${RESET}" ;;
+            *)       status_colored="${RED}${status}${RESET}" ;;
+        esac
+
+        printf "%-20s %-30s %-10b %-6s %-6s %-4s %s\n" \
+            "$branch" "$container_name" "$status_colored" "$port" "$idle" "$ci" "$note"
+    done < <(list_wk_worktrees)
+}
+
+cmd_ssh() {
+    local branch="$1"
+
+    if [[ -z "$branch" ]]; then
+        branch="$(current_worktree_branch 2>/dev/null || true)"
+        [[ -z "$branch" ]] && branch="$(select_branch_fzf "ssh")"
+    fi
+
+    local wt_path=""
+    while IFS=' ' read -r b p; do
+        [[ "$b" == "$branch" ]] && { wt_path="$p"; break; }
+    done < <(list_wk_worktrees)
+
+    [[ -z "$wt_path" ]] && die "worktree not found for branch: $branch"
+
+    ensure_running "$wt_path"
+
+    local port
+    port="$(get_ssh_port_from_compose "$wt_path")"
+    wait_ssh_ready "$port"
+    touch_active "$wt_path"
+
+    ssh -o StrictHostKeyChecking=no -p "$port" root@localhost
+}
+
+cmd_exec() {
+    local branch="" cmd_args=()
+
+    # If first arg matches a known worktree branch, use it; otherwise assume current
+    if [[ $# -gt 0 ]]; then
+        local maybe_branch="$1"
+        local found=false
+        while IFS=' ' read -r b p; do
+            [[ "$b" == "$maybe_branch" ]] && { found=true; break; }
+        done < <(list_wk_worktrees)
+
+        if $found; then
+            branch="$maybe_branch"
+            shift
+        fi
+    fi
+
+    if [[ -z "$branch" ]]; then
+        branch="$(current_worktree_branch 2>/dev/null || true)"
+        [[ -z "$branch" ]] && die "not inside a wk worktree and no branch specified"
+    fi
+
+    cmd_args=("$@")
+    [[ ${#cmd_args[@]} -eq 0 ]] && die "usage: wk exec [branch] <command...>"
+
+    local wt_path=""
+    while IFS=' ' read -r b p; do
+        [[ "$b" == "$branch" ]] && { wt_path="$p"; break; }
+    done < <(list_wk_worktrees)
+
+    [[ -z "$wt_path" ]] && die "worktree not found for branch: $branch"
+
+    ensure_running "$wt_path"
+    touch_active "$wt_path"
+
+    local container_name
+    container_name="$(docker compose -f "$(compose_file_for "$wt_path")" ps -a --format '{{.Name}}' 2>/dev/null | head -1)"
+
+    if [[ -z "$container_name" ]]; then
+        container_name="$(container_name_for "$branch")"
+        local service_name
+        service_name="$(yq eval '.services | keys | .[0]' "$(compose_file_for "$wt_path")" 2>/dev/null || echo "hashdata")"
+        container_name="${container_name}-${service_name}-1"
+    fi
+
+    docker exec -it "$container_name" bash -c "${cmd_args[*]}"
+}
+
+cmd_project_command() {
+    local cmd_name="$1"; shift
+    local cmd_str
+    cmd_str="$(yaml_get ".commands.${cmd_name} // \"\"")"
+    [[ -z "$cmd_str" || "$cmd_str" == "null" ]] && die "unknown command: $cmd_name (not in .wk.yaml commands)"
+    cmd_exec "$@" "$cmd_str"
+}
+
+cmd_var() {
+    local action="$1"; shift
+
+    local branch
+    branch="$(current_worktree_branch 2>/dev/null || true)"
+    [[ -z "$branch" ]] && die "not inside a wk worktree"
+
+    local wt_path=""
+    while IFS=' ' read -r b p; do
+        [[ "$b" == "$branch" ]] && { wt_path="$p"; break; }
+    done < <(list_wk_worktrees)
+
+    [[ -z "$wt_path" ]] && die "worktree not found for branch: $branch"
+
+    local vars_file="$wt_path/.wk/vars"
+
+    case "$action" in
+        set)
+            [[ $# -lt 2 ]] && die "usage: wk var set <key> <value>"
+            local key="$1" value="$2"
+            mkdir -p "$wt_path/.wk"
+            if [[ -f "$vars_file" ]] && grep -q "^${key}=" "$vars_file" 2>/dev/null; then
+                sed -i '' "s|^${key}=.*|${key}=${value}|" "$vars_file"
+            else
+                echo "${key}=${value}" >> "$vars_file"
+            fi
+            info "set $key=$value"
+            ;;
+        get)
+            [[ $# -lt 1 ]] && die "usage: wk var get <key>"
+            local key="$1"
+            if [[ -f "$vars_file" ]]; then
+                grep "^${key}=" "$vars_file" 2>/dev/null | cut -d= -f2- || true
+            fi
+            ;;
+        *)
+            die "usage: wk var <set|get> ..."
+            ;;
+    esac
+}
+
+cmd_watch() {
+    local action="${1:-start}"
+
+    local pid_file="$HOME/.wk/watch.pid"
+    local log_file="$HOME/.wk/watch.log"
+    mkdir -p "$HOME/.wk"
+
+    case "$action" in
+        stop)
+            if [[ -f "$pid_file" ]]; then
+                local pid
+                pid="$(cat "$pid_file")"
+                if kill -0 "$pid" 2>/dev/null; then
+                    kill "$pid"
+                    info "watch stopped (pid $pid)"
+                else
+                    warn "process $pid not running"
+                fi
+                rm -f "$pid_file"
+            else
+                warn "watch not running"
+            fi
+            ;;
+        status)
+            if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+                info "watch running (pid $(cat "$pid_file"))"
+            else
+                info "watch not running"
+            fi
+            echo ""
+            printf "${BOLD}%-20s %-10s %-8s${RESET}\n" "BRANCH" "STATUS" "IDLE"
+            while IFS=' ' read -r branch wt_path; do
+                [[ -z "$branch" ]] && continue
+                local status idle
+                status="$(container_status "$wt_path")"
+                if [[ -f "$wt_path/.wk/last-active" ]]; then
+                    local now last_active diff
+                    now="$(date +%s)"
+                    last_active="$(stat -f %m "$wt_path/.wk/last-active" 2>/dev/null || stat -c %Y "$wt_path/.wk/last-active" 2>/dev/null || echo "$now")"
+                    diff=$(( now - last_active ))
+                    if (( diff < 60 )); then idle="${diff}s"
+                    elif (( diff < 3600 )); then idle="$(( diff / 60 ))m"
+                    elif (( diff < 86400 )); then idle="$(( diff / 3600 ))h"
+                    else idle="$(( diff / 86400 ))d"
+                    fi
+                else
+                    idle="-"
+                fi
+                printf "%-20s %-10s %-8s\n" "$branch" "$status" "$idle"
+            done < <(list_wk_worktrees)
+            ;;
+        start|"")
+            if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
+                die "watch already running (pid $(cat "$pid_file"))"
+            fi
+
+            local interval idle_timeout
+            interval="$(yaml_get '.watch.interval // "10m"')"
+            idle_timeout="$(yaml_get '.watch.idle_timeout // "4h"')"
+
+            info "starting watch (interval=${interval}, idle_timeout=${idle_timeout})"
+            info "log: $log_file"
+
+            local self
+            self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+            nohup "$self" _watch-loop "$REPO_ROOT" "$interval" "$idle_timeout" \
+                >> "$log_file" 2>&1 &
+            local bg_pid=$!
+            echo "$bg_pid" > "$pid_file"
+            disown
+
+            sleep 0.5
+            if kill -0 "$bg_pid" 2>/dev/null; then
+                info "watch started (pid $bg_pid)"
+            else
+                die "watch failed to start, check $log_file"
+            fi
+            ;;
+        *)
+            die "usage: wk watch [start|stop|status]"
+            ;;
+    esac
+}
+
+parse_duration() {
+    local input="$1"
+    local num="${input%[smhd]*}"
+    local unit="${input##*[0-9]}"
+    case "$unit" in
+        s|"") echo "$num" ;;
+        m)    echo $(( num * 60 )) ;;
+        h)    echo $(( num * 3600 )) ;;
+        d)    echo $(( num * 86400 )) ;;
+        *)    echo "$num" ;;
+    esac
+}
+
+cmd_help() {
+    cat <<'EOF'
+wk — worktree isolation development tool
+
+Usage: wk <command> [args]
+
+Environment lifecycle:
+  new <branch|pr:NNN> [--copy-cache]   Create worktree + container
+  rm  [-f] [branch]                    Remove worktree + container
+  ls                                   List all worktrees
+
+Environment operations:
+  ssh  [branch]            SSH into container (auto-wake)
+  exec [branch] <cmd...>  Execute command in container
+
+Project commands (from .wk.yaml):
+  build                    Build in container
+  deploy                   Deploy GP cluster
+  test                     Run tests
+  <custom>                 Any command defined in .wk.yaml
+
+Metadata:
+  var set <key> <value>    Set per-worktree variable
+  var get <key>            Get per-worktree variable
+
+Monitoring:
+  watch [start]            Start idle-container monitor
+  watch stop               Stop monitor
+  watch status             Show monitor status
+
+EOF
+}
+
+# --- Main dispatch ---
+cmd="${1:-help}"
+shift || true
+
+# Commands that don't need repo context
+case "$cmd" in
+    help|-h|--help) cmd_help; exit 0 ;;
+    _watch-loop)
+        # Internal: daemon loop called by `wk watch start`
+        # Args: <repo_root> <interval> <idle_timeout>
+        REPO_ROOT="$1"; _interval="$2"; _idle_timeout="$3"
+        _interval_s="$(parse_duration "$_interval")"
+        _idle_timeout_s="$(parse_duration "$_idle_timeout")"
+        while true; do
+            while IFS=' ' read -r _branch _wt_path; do
+                [[ -z "$_branch" ]] && continue
+                _status="$(container_status "$_wt_path")"
+                if [[ "$_status" == "running" && -f "$_wt_path/.wk/last-active" ]]; then
+                    _now="$(date +%s)"
+                    _last="$(stat -f %m "$_wt_path/.wk/last-active" 2>/dev/null || stat -c %Y "$_wt_path/.wk/last-active" 2>/dev/null || echo "$_now")"
+                    _diff=$(( _now - _last ))
+                    if (( _diff > _idle_timeout_s )); then
+                        echo "$(date): pausing $_branch (idle ${_diff}s)"
+                        docker compose -f "$(compose_file_for "$_wt_path")" pause 2>/dev/null || true
+                    fi
+                fi
+            done < <(list_wk_worktrees)
+            sleep "$_interval_s"
+        done
+        exit 0
+        ;;
+esac
+
+# All other commands need repo context
+require_repo
+
+case "$cmd" in
+    new)    cmd_new "$@" ;;
+    rm)     cmd_rm "$@" ;;
+    ls)     cmd_ls ;;
+    ssh)    cmd_ssh "${1:-}" ;;
+    exec)   cmd_exec "$@" ;;
+    var)    cmd_var "$@" ;;
+    watch)  cmd_watch "${1:-start}" ;;
+    *)
+        # Check if it's a project command from .wk.yaml
+        cmd_str="$(yaml_get ".commands.${cmd} // \"\"" 2>/dev/null || true)"
+        if [[ -n "$cmd_str" && "$cmd_str" != "null" ]]; then
+            cmd_project_command "$cmd" "$@"
+        else
+            die "unknown command: $cmd (try 'wk help')"
+        fi
+        ;;
+esac
