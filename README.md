@@ -78,8 +78,8 @@ wk ssh
 wk build
 wk test
 
-# Execute any command in the container
-wk exec make clean
+# Run any ad-hoc command inside the container (no .wk.yaml needed)
+wk exec make clean          # → docker exec <container> bash -c "make clean"
 
 # Remove when done
 wk rm feature/my-work
@@ -102,7 +102,7 @@ wk rm -f [branch]         # Force remove (skip uncommitted check)
 ```bash
 wk ls                     # List all worktrees with status
 wk ssh [branch]           # SSH into container (auto-wakes)
-wk exec [branch] <cmd>    # Run command in container (auto-wakes)
+wk exec [branch] <cmd>    # Run ad-hoc command inside container (auto-wakes)
 ```
 
 ### Project Commands
