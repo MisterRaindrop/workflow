@@ -33,11 +33,16 @@ yaml_get() { require_repo; yq eval "$1" "$REPO_ROOT/.wk.yaml" 2>/dev/null; }
 # --- Branch / worktree helpers ---
 # Portable sed -i (macOS needs '' arg, Linux does not)
 sed_i() {
-    if sed --version 2>/dev/null | grep -q GNU; then
-        sed -i "$@"
+    if [[ "$(uname)" == "Darwin" ]]; then
+        sed -i '' "$@"
     else
-        sed_i "$@"
+        sed -i "$@"
     fi
+}
+
+# Portable stat mtime (GNU first, macOS fallback)
+stat_mtime() {
+    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
 }
 
 sanitize_branch() { echo "$1" | tr '/' '-' | tr '[:upper:]' '[:lower:]'; }
@@ -421,7 +426,7 @@ cmd_ls() {
         if [[ -f "$wt_path/.wk/last-active" ]]; then
             local now last_active diff
             now="$(date +%s)"
-            last_active="$(stat -f %m "$wt_path/.wk/last-active" 2>/dev/null || stat -c %Y "$wt_path/.wk/last-active" 2>/dev/null || echo "$now")"
+            last_active="$(stat_mtime "$wt_path/.wk/last-active" || echo "$now")"
             diff=$(( now - last_active ))
             if (( diff < 60 )); then
                 idle="${diff}s"
@@ -628,7 +633,7 @@ cmd_watch() {
                 if [[ -f "$wt_path/.wk/last-active" ]]; then
                     local now last_active diff
                     now="$(date +%s)"
-                    last_active="$(stat -f %m "$wt_path/.wk/last-active" 2>/dev/null || stat -c %Y "$wt_path/.wk/last-active" 2>/dev/null || echo "$now")"
+                    last_active="$(stat_mtime "$wt_path/.wk/last-active" || echo "$now")"
                     diff=$(( now - last_active ))
                     if (( diff < 60 )); then idle="${diff}s"
                     elif (( diff < 3600 )); then idle="$(( diff / 60 ))m"
@@ -739,7 +744,7 @@ case "$cmd" in
                 _status="$(container_status "$_wt_path")"
                 if [[ "$_status" == "running" && -f "$_wt_path/.wk/last-active" ]]; then
                     _now="$(date +%s)"
-                    _last="$(stat -f %m "$_wt_path/.wk/last-active" 2>/dev/null || stat -c %Y "$_wt_path/.wk/last-active" 2>/dev/null || echo "$_now")"
+                    _last="$(stat_mtime "$_wt_path/.wk/last-active" || echo "$_now")"
                     _diff=$(( _now - _last ))
                     if (( _diff > _idle_timeout_s )); then
                         echo "$(date): pausing $_branch (idle ${_diff}s)"
