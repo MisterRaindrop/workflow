@@ -107,11 +107,24 @@ wk exec [branch] <cmd>    # Run command in container (auto-wakes)
 
 ### Project Commands
 
-```bash
-wk build                  # Run "build" from .wk.yaml
-wk test                   # Run "test" from .wk.yaml
-wk <any-name>             # Run any command defined in .wk.yaml
+Any key you add under `commands:` in `.wk.yaml` becomes a `wk` subcommand:
+
+```yaml
+# .wk.yaml
+commands:
+  build:   "make -j$(nproc)"
+  test:    "make test"
+  lint:    "npm run lint"
+  migrate: "python manage.py migrate"
 ```
+
+```bash
+wk build      # → docker exec <container> bash -c "make -j$(nproc)"
+wk lint       # → docker exec <container> bash -c "npm run lint"
+wk migrate    # → docker exec <container> bash -c "python manage.py migrate"
+```
+
+Add as many commands as you like. The name is yours to choose — `wk` looks it up in `.wk.yaml` at runtime.
 
 ### Metadata
 
