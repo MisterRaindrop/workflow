@@ -106,13 +106,53 @@ list_wk_worktrees() {
 }
 
 # Select a branch via fzf (from wk-managed worktrees)
+# Falls back to auto-select if fzf is not installed
 select_branch_fzf() {
     local prompt="${1:-select branch}"
     local branches
     branches="$(list_wk_worktrees | awk '{print $1}')"
     [[ -z "$branches" ]] && die "no wk-managed worktrees found"
-    echo "$branches" | fzf --prompt="$prompt> " --height=10 --reverse \
-        || die "no branch selected"
+
+    local count
+    count="$(echo "$branches" | wc -l | tr -d ' ')"
+
+    # Single worktree — just use it
+    if [[ "$count" -eq 1 ]]; then
+        echo "$branches"
+        return
+    fi
+
+    # Try fzf
+    if command -v fzf &>/dev/null; then
+        echo "$branches" | fzf --prompt="$prompt> " --height=10 --reverse \
+            || die "no branch selected"
+        return
+    fi
+
+    # No fzf — show list and ask user to specify
+    warn "fzf not installed, available branches:"
+    echo "$branches" | while read -r b; do printf "  %s\n" "$b"; done >&2
+    die "specify a branch: wk $prompt <branch>"
+}
+
+# Resolve a user-supplied arg to a known branch name
+# Accepts: exact branch, sanitized branch, or container name
+resolve_worktree_arg() {
+    local arg="$1"
+    local branch="" sanitized_arg
+    sanitized_arg="$(sanitize_branch "$arg")"
+
+    while IFS=' ' read -r b p; do
+        # Exact branch match
+        [[ "$b" == "$arg" ]] && { echo "$b"; return; }
+        # Sanitized match (feature/test == feature-test)
+        [[ "$(sanitize_branch "$b")" == "$sanitized_arg" ]] && { echo "$b"; return; }
+        # Container name match (lightning-feature-test)
+        [[ "$(container_name_for "$b")" == "$arg" ]] && { echo "$b"; return; }
+    done < <(list_wk_worktrees)
+
+    # No match
+    echo ""
 }
 
 # --- Container operations ---
@@ -303,8 +343,12 @@ cmd_rm() {
         esac
     done
 
-    if [[ -z "$branch" ]]; then
-        branch="$(select_branch_fzf "remove")"
+    if [[ -n "$branch" ]]; then
+        local resolved
+        resolved="$(resolve_worktree_arg "$branch")"
+        [[ -n "$resolved" ]] && branch="$resolved"
+    else
+        branch="$(select_branch_fzf "rm")"
     fi
 
     local wt_path=""
@@ -417,7 +461,12 @@ cmd_ls() {
 cmd_ssh() {
     local branch="$1"
 
-    if [[ -z "$branch" ]]; then
+    if [[ -n "$branch" ]]; then
+        # Try fuzzy resolve (exact branch, sanitized, or container name)
+        local resolved
+        resolved="$(resolve_worktree_arg "$branch")"
+        [[ -n "$resolved" ]] && branch="$resolved"
+    else
         branch="$(current_worktree_branch 2>/dev/null || true)"
         [[ -z "$branch" ]] && branch="$(select_branch_fzf "ssh")"
     fi
@@ -444,14 +493,10 @@ cmd_exec() {
 
     # If first arg matches a known worktree branch, use it; otherwise assume current
     if [[ $# -gt 0 ]]; then
-        local maybe_branch="$1"
-        local found=false
-        while IFS=' ' read -r b p; do
-            [[ "$b" == "$maybe_branch" ]] && { found=true; break; }
-        done < <(list_wk_worktrees)
-
-        if $found; then
-            branch="$maybe_branch"
+        local resolved
+        resolved="$(resolve_worktree_arg "$1")"
+        if [[ -n "$resolved" ]]; then
+            branch="$resolved"
             shift
         fi
     fi
