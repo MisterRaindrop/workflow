@@ -31,6 +31,15 @@ require_repo() {
 yaml_get() { require_repo; yq eval "$1" "$REPO_ROOT/.wk.yaml" 2>/dev/null; }
 
 # --- Branch / worktree helpers ---
+# Portable sed -i (macOS needs '' arg, Linux does not)
+sed_i() {
+    if sed --version 2>/dev/null | grep -q GNU; then
+        sed -i "$@"
+    else
+        sed_i "$@"
+    fi
+}
+
 sanitize_branch() { echo "$1" | tr '/' '-' | tr '[:upper:]' '[:lower:]'; }
 
 ssh_port_for() {
@@ -288,15 +297,15 @@ cmd_new() {
 
     cp "$src_compose" "$dst_compose"
     # Replace compose project name
-    sed -i '' "s/^name: .*/name: $container_name/" "$dst_compose"
+    sed_i "s/^name: .*/name: $container_name/" "$dst_compose"
     # Replace hostname
-    sed -i '' "s/hostname: .*/hostname: $sanitized/" "$dst_compose"
+    sed_i "s/hostname: .*/hostname: $sanitized/" "$dst_compose"
     # Replace SSH port
-    sed -i '' "s/\"[0-9]*:22\"/\"$port:22\"/" "$dst_compose"
+    sed_i "s/\"[0-9]*:22\"/\"$port:22\"/" "$dst_compose"
     # Fix volumes: .:/workspace/ → wt_path:/workspace/
-    sed -i '' "s|- \.:/workspace/|- $wt_path:/workspace/|" "$dst_compose"
+    sed_i "s|- \.:/workspace/|- $wt_path:/workspace/|" "$dst_compose"
     # Fix volumes: .cache/ → wt_path/.cache/
-    sed -i '' "s|- \.cache/:/cache/|- $wt_path/.cache/:/cache/|" "$dst_compose"
+    sed_i "s|- \.cache/:/cache/|- $wt_path/.cache/:/cache/|" "$dst_compose"
 
     # Copy cache if requested
     if $copy_cache && [[ -d "$REPO_ROOT/.cache" ]]; then
@@ -562,7 +571,7 @@ cmd_var() {
             local key="$1" value="$2"
             mkdir -p "$wt_path/.wk"
             if [[ -f "$vars_file" ]] && grep -q "^${key}=" "$vars_file" 2>/dev/null; then
-                sed -i '' "s|^${key}=.*|${key}=${value}|" "$vars_file"
+                sed_i "s|^${key}=.*|${key}=${value}|" "$vars_file"
             else
                 echo "${key}=${value}" >> "$vars_file"
             fi
