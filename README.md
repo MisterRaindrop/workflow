@@ -34,19 +34,30 @@ For auto-cd after `wk new`, add the shell function printed by `install.sh` to yo
 Create a `.wk.yaml` in your project root:
 
 ```yaml
-# Worktree path template (optional)
+# Where to create worktrees (optional, this is the default)
+# Available variables:
+#   {{ repo_path }}          — absolute path of the main repo
+#   {{ repo }}               — directory name of the main repo
+#   {{ branch | sanitize }}  — branch name with / replaced by -
 path: "{{ repo_path }}/../{{ repo }}-{{ branch | sanitize }}"
 
-# Project commands — run with `wk <name>`
+# Custom commands — each entry becomes `wk <name>`
+# Add as many as you need. The command runs inside the container via docker exec.
 commands:
-  build:  "make -j$(nproc)"
-  test:   "make test"
-  deploy: "scripts/deploy.sh"
+  build:   "make -j$(nproc)"
+  test:    "make test"
+  deploy:  "scripts/deploy.sh"
+  lint:    "npm run lint"
+  migrate: "python manage.py migrate"
+  # wk build   → docker exec <container> bash -c "make -j$(nproc)"
+  # wk lint    → docker exec <container> bash -c "npm run lint"
+  # ... any name works
 
-# Idle container monitoring (optional)
+# Auto-pause idle containers (optional)
+# Requires `wk watch` to be running in the background.
 watch:
-  interval: 10m
-  idle_timeout: 4h
+  interval: 10m        # how often to check
+  idle_timeout: 4h     # pause containers idle longer than this
 ```
 
 Your `docker-compose.yml` needs no changes. `wk new` copies it, then patches the project name, hostname, and SSH port automatically.
