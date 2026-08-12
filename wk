@@ -1,781 +1,1706 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# wk — LXD container manager for isolated dev/CI environments.
+#
+# Model: long-lived LXD containers ("slots"), each running its own Docker daemon.
+# Code is a plain host directory you clone yourself; wk only mounts it.
+# All state lives in LXD (container state + user.wk.* config), never in files.
+set -Eeuo pipefail
 
-# --- Colors & helpers ---
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; DIM='\033[2m'; RESET='\033[0m'
+WK_VERSION=2.0.0
 
-die()  { printf "${RED}error:${RESET} %s\n" "$*" >&2; exit 1; }
-warn() { printf "${YELLOW}warn:${RESET} %s\n" "$*" >&2; }
-info() { printf "${GREEN}=>${RESET} %s\n" "$*"; }
+# --- Config -------------------------------------------------------------------
+# Load /etc/wk/config.env first, then let the environment win.
+WK_CONFIG=${WK_CONFIG:-/etc/wk/config.env}
+if [[ -f "$WK_CONFIG" ]]; then
+    # shellcheck disable=SC1090
+    source "$WK_CONFIG"
+fi
 
-# --- Repo detection ---
-find_repo_root() {
-    local dir="$PWD"
-    while [[ "$dir" != "/" ]]; do
-        [[ -f "$dir/.wk.yaml" ]] && { echo "$dir"; return; }
-        dir="$(dirname "$dir")"
-    done
-    die "not inside a wk-managed repo (no .wk.yaml found)"
+WK_LXC=${WK_LXC:-lxc}
+WK_POOL=${WK_POOL:-data500}
+WK_DATA_ROOT=${WK_DATA_ROOT:-/mnt/data500/wk}
+WK_IMAGE=${WK_IMAGE:-ubuntu:24.04}
+WK_SLOTS=${WK_SLOTS:-"lxslot1 lxslot2 lxslot3"}
+WK_IMAGE_CACHE=${WK_IMAGE_CACHE:-$WK_DATA_ROOT/image-cache}
+WK_WARM_IMAGES=${WK_WARM_IMAGES:-}
+WK_CACHE_MAX_GB=${WK_CACHE_MAX_GB:-50}
+
+# URLs `wk doctor` actually fetches to answer "can I build right now?". Port
+# reachability is not enough: the proxy has been observed accepting connections
+# while returning 502. Space separated; empty disables the probe.
+WK_PROBE_URLS=${WK_PROBE_URLS:-}
+WK_NETWORKS=${WK_NETWORKS:-}
+WK_CODE_UID=${WK_CODE_UID:-1000}
+WK_CODE_GID=${WK_CODE_GID:-1000}
+WK_MEM_SAFETY=${WK_MEM_SAFETY:-80}   # percent of available memory we are willing to commit
+WK_PROXY=${WK_PROXY:-${HTTPS_PROXY:-${https_proxy:-${HTTP_PROXY:-${http_proxy:-}}}}}
+WK_NO_PROXY=${WK_NO_PROXY:-${NO_PROXY:-${no_proxy:-localhost,127.0.0.1,::1}}}
+
+# Where per-container lock files live. /run is tmpfs, so a killed process or a
+# reboot never leaves a stale lock behind. Falls back to $TMPDIR if unavailable.
+WK_RUN_DIR=${WK_RUN_DIR:-/run/wk}
+WK_LOCK_WAIT=${WK_LOCK_WAIT:-30}
+
+# Addresses containers may reach *directly*, bypassing the proxy. Needed for
+# internal services that build tools cannot proxy to: Maven, for instance, does
+# not honour HTTP_PROXY, and some images hard-set MAVEN_OPTS so it cannot be
+# injected either. Space-separated IPs or CIDRs.
+WK_DIRECT_HOSTS=${WK_DIRECT_HOSTS:-}
+
+# Device name holding the bound code directory. Containers built by an earlier
+# tool may use a different one; name it in WK_LEGACY_DEVICE and wk will keep
+# recognising them, so nothing project-specific has to live in this file.
+WK_SOURCE_DEVICES=(wk-source ${WK_LEGACY_DEVICE:+"$WK_LEGACY_DEVICE"})
+
+# --- Output -------------------------------------------------------------------
+if [[ -t 1 ]]; then
+    RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[0;33m'
+    CYAN=$'\033[0;36m'; BOLD=$'\033[1m'; DIM=$'\033[2m'; RESET=$'\033[0m'
+else
+    RED=''; GREEN=''; YELLOW=''; CYAN=''; BOLD=''; DIM=''; RESET=''
+fi
+
+die()  { printf '%serror:%s %s\n' "$RED" "$RESET" "$*" >&2; exit 1; }
+warn() { printf '%swarn:%s %s\n' "$YELLOW" "$RESET" "$*" >&2; }
+info() { printf '%s=>%s %s\n' "$GREEN" "$RESET" "$*"; }
+step() { printf '%s--%s %s\n' "$DIM" "$RESET" "$*"; }
+
+# --- Host indirection ---------------------------------------------------------
+# Every lxc call goes through here so a future --host only changes this function.
+lxc_() { "$WK_LXC" "$@"; }
+
+need_cmd() { command -v "$1" >/dev/null 2>&1 || die "$1 is required"; }
+
+# --- Audit trail --------------------------------------------------------------
+# Write operations only, to journald (`journalctl -t wk`). Chosen over a private
+# log file because rotation, permissions and concurrent writes come for free.
+# Never record credential contents — only which container was seeded.
+audit() {
+    command -v logger >/dev/null 2>&1 || return 0
+    logger -t wk -- "$* [by ${SUDO_USER:-${USER:-unknown}}]" 2>/dev/null || true
 }
 
-# REPO_ROOT is set lazily — see require_repo()
-REPO_ROOT=""
+# --- Per-container lock -------------------------------------------------------
+# Taken ONCE, at a command's entry point. Internal helpers must never take it:
+# cmd_bind calls services_up, and locking in both would deadlock against itself.
+#
+#   shared (-s)    exec / enter / dexec / smoke — long jobs that may overlap
+#   exclusive (-x) anything that mutates the container
+#
+# fd 9 is fixed rather than `exec {var}>` because that syntax needs bash 4.1,
+# and the test suite runs on macOS's bash 3.2. The lock is released when the
+# process exits, so no explicit unlock is needed.
+lock_slot() {
+    local name=$1 mode=${2:-x} dir=$WK_RUN_DIR
+    command -v flock >/dev/null 2>&1 || return 0     # degrade, never fail (§3.6)
 
-require_repo() {
-    [[ -n "$REPO_ROOT" ]] && return
-    REPO_ROOT="$(find_repo_root)"
+    mkdir -p "$dir" 2>/dev/null || dir="${TMPDIR:-/tmp}/wk"
+    mkdir -p "$dir" 2>/dev/null || return 0
+    # Braces matter: a bare `exec 9>f 2>/dev/null` would redirect THIS shell's
+    # stderr to /dev/null permanently, silently swallowing every later error.
+    { exec 9>"$dir/$name.lock"; } 2>/dev/null || return 0
+
+    flock "-$mode" -w "$WK_LOCK_WAIT" 9 2>/dev/null && return 0
+    die "$name is busy: another wk operation holds the lock (waited ${WK_LOCK_WAIT}s).
+     See what is running with: wk ls   —   lock file: $dir/$name.lock"
 }
 
-# --- YAML helper (requires yq) ---
-yaml_get() { require_repo; yq eval "$1" "$REPO_ROOT/.wk.yaml" 2>/dev/null; }
-
-# --- Branch / worktree helpers ---
-# Portable sed -i (macOS needs '' arg, Linux does not)
-sed_i() {
-    if [[ "$(uname)" == "Darwin" ]]; then
-        sed -i '' "$@"
-    else
-        sed -i "$@"
+# --- Pure helpers (unit-tested) -----------------------------------------------
+fmt_duration() {
+    local s=${1:-0}
+    (( s < 0 )) && s=0
+    if   (( s < 60 ));    then printf '%ds' "$s"
+    elif (( s < 3600 ));  then printf '%dm' "$(( s / 60 ))"
+    elif (( s < 86400 )); then printf '%dh' "$(( s / 3600 ))"
+    else                       printf '%dd' "$(( s / 86400 ))"
     fi
-}
-
-# Portable stat mtime (GNU first, macOS fallback)
-stat_mtime() {
-    stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null
-}
-
-sanitize_branch() { echo "$1" | tr '/' '-' | tr '[:upper:]' '[:lower:]'; }
-
-ssh_port_for() {
-    local hash
-    hash=$(echo -n "$1" | cksum | awk '{print $1}')
-    echo $(( 10000 + hash % 9000 ))
-}
-
-compose_file_for() { echo "$1/.wk/docker-compose.yml"; }
-
-container_name_for() { echo "project-$(sanitize_branch "$1")"; }
-
-# Resolve branch from pr:NNN or plain name
-resolve_branch() {
-    local arg="$1"
-    if [[ "$arg" == pr:* ]]; then
-        local pr_num="${arg#pr:}"
-        gh pr view "$pr_num" --json headRefName -q '.headRefName' \
-            || die "cannot resolve PR #$pr_num"
-    else
-        echo "$arg"
-    fi
-}
-
-# Get worktree path for a branch
-worktree_path_for() {
-    local branch="$1"
-    local sanitized
-    sanitized="$(sanitize_branch "$branch")"
-    local repo_name
-    repo_name="$(basename "$REPO_ROOT")"
-    local tmpl
-    tmpl="$(yaml_get '.path // ""')"
-    if [[ -n "$tmpl" && "$tmpl" != "null" ]]; then
-        echo "$tmpl" \
-            | sed "s|{{ *repo_path *}}|$REPO_ROOT|g" \
-            | sed "s|{{ *repo *}}|$repo_name|g" \
-            | sed "s|{{ *branch *| *sanitize *}}|$sanitized|g" \
-            | sed "s|{{ *branch *}}|$sanitized|g"
-    else
-        echo "$REPO_ROOT/../${repo_name}-${sanitized}"
-    fi
-}
-
-# Detect current worktree branch (if pwd is inside one)
-current_worktree_branch() {
-    local wt_path
-    wt_path="$(git -C "$REPO_ROOT" worktree list --porcelain | awk '
-        /^worktree / { path=$2 }
-        /^branch /   { branch=$2; print path " " branch }
-    ')"
-    local cwd="$PWD"
-    while IFS=' ' read -r path branch; do
-        [[ "$path" == "$REPO_ROOT" ]] && continue
-        if [[ "$cwd" == "$path"* ]]; then
-            echo "${branch#refs/heads/}"
-            return
-        fi
-    done <<< "$wt_path"
-    return 1
-}
-
-# List all wk-managed worktrees (those with .wk/ directory)
-list_wk_worktrees() {
-    git -C "$REPO_ROOT" worktree list --porcelain | awk '
-        /^worktree / { path=$2 }
-        /^branch /   { branch=$2; print path " " branch }
-    ' | while IFS=' ' read -r path branch; do
-        [[ "$path" == "$REPO_ROOT" ]] && continue
-        [[ -d "$path/.wk" ]] || continue
-        echo "${branch#refs/heads/} $path"
-    done
-}
-
-# Select a branch via fzf (from wk-managed worktrees)
-# Falls back to auto-select if fzf is not installed
-select_branch_fzf() {
-    local prompt="${1:-select branch}"
-    local branches
-    branches="$(list_wk_worktrees | awk '{print $1}')"
-    [[ -z "$branches" ]] && die "no wk-managed worktrees found"
-
-    local count
-    count="$(echo "$branches" | wc -l | tr -d ' ')"
-
-    # Single worktree — just use it
-    if [[ "$count" -eq 1 ]]; then
-        echo "$branches"
-        return
-    fi
-
-    # Try fzf
-    if command -v fzf &>/dev/null; then
-        echo "$branches" | fzf --prompt="$prompt> " --height=10 --reverse \
-            || die "no branch selected"
-        return
-    fi
-
-    # No fzf — show list and ask user to specify
-    warn "fzf not installed, available branches:"
-    echo "$branches" | while read -r b; do printf "  %s\n" "$b"; done >&2
-    die "specify a branch: wk $prompt <branch>"
-}
-
-# Resolve a user-supplied arg to a known branch name
-# Accepts: exact branch, sanitized branch, or container name
-resolve_worktree_arg() {
-    local arg="$1"
-    local branch="" sanitized_arg
-    sanitized_arg="$(sanitize_branch "$arg")"
-
-    while IFS=' ' read -r b p; do
-        # Exact branch match
-        [[ "$b" == "$arg" ]] && { echo "$b"; return; }
-        # Sanitized match (feature/test == feature-test)
-        [[ "$(sanitize_branch "$b")" == "$sanitized_arg" ]] && { echo "$b"; return; }
-        # Container name match (project-feature-test)
-        [[ "$(container_name_for "$b")" == "$arg" ]] && { echo "$b"; return; }
-    done < <(list_wk_worktrees)
-
-    # No match
-    echo ""
-}
-
-# --- Container operations ---
-compose_cmd() {
-    local wt_path="$1"; shift
-    local cf
-    cf="$(compose_file_for "$wt_path")"
-    [[ -f "$cf" ]] || die "compose file not found: $cf"
-    docker compose -f "$cf" "$@"
-}
-
-container_status() {
-    local wt_path="$1"
-    local cf
-    cf="$(compose_file_for "$wt_path")"
-    [[ -f "$cf" ]] || { echo "no-compose"; return; }
-    local state
-    state="$(docker compose -f "$cf" ps --status running --format '{{.State}}' 2>/dev/null | head -1)"
-    if [[ -n "$state" ]]; then
-        echo "$state"
-        return
-    fi
-    state="$(docker compose -f "$cf" ps -a --format '{{.State}}' 2>/dev/null | head -1)"
-    echo "${state:-stopped}"
-}
-
-ensure_running() {
-    local wt_path="$1"
-    local status
-    status="$(container_status "$wt_path")"
-    case "$status" in
-        running) return ;;
-        paused)
-            info "unpausing container..."
-            compose_cmd "$wt_path" unpause
-            ;;
-        stopped|exited|created)
-            info "starting container..."
-            compose_cmd "$wt_path" start
-            ;;
-        no-compose)
-            die "no .wk/docker-compose.yml in $wt_path"
-            ;;
-        *)
-            info "container status: $status, trying start..."
-            compose_cmd "$wt_path" up -d
-            ;;
-    esac
-}
-
-wait_ssh_ready() {
-    local port="$1" max_wait=30 i=0
-    info "waiting for SSH on port $port..."
-    while (( i < max_wait )); do
-        if ssh -o ConnectTimeout=1 -o StrictHostKeyChecking=no -o BatchMode=yes \
-               -p "$port" root@localhost true 2>/dev/null; then
-            return 0
-        fi
-        sleep 1
-        (( i++ ))
-    done
-    warn "SSH not ready after ${max_wait}s, attempting connection anyway"
-}
-
-touch_active() {
-    local wt_path="$1"
-    mkdir -p "$wt_path/.wk"
-    touch "$wt_path/.wk/last-active"
-}
-
-get_ssh_port_from_compose() {
-    local wt_path="$1"
-    local cf
-    cf="$(compose_file_for "$wt_path")"
-    [[ -f "$cf" ]] || return 1
-    sed -n 's/.*"\([0-9]*\):22".*/\1/p' "$cf" 2>/dev/null || echo "?"
-}
-
-# --- Commands ---
-
-cmd_new() {
-    local branch="" copy_cache=false
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            --copy-cache) copy_cache=true; shift ;;
-            *) branch="$1"; shift ;;
-        esac
-    done
-    [[ -z "$branch" ]] && die "usage: wk new <branch|pr:NNN> [--copy-cache]"
-
-    branch="$(resolve_branch "$branch")"
-    local sanitized wt_path
-    sanitized="$(sanitize_branch "$branch")"
-    wt_path="$(worktree_path_for "$branch")"
-    wt_path="$(cd "$REPO_ROOT" && cd "$(dirname "$wt_path")" && echo "$PWD/$(basename "$wt_path")")"
-
-    info "branch: $branch"
-    info "worktree: $wt_path"
-
-    # Create worktree
-    if [[ -d "$wt_path" ]]; then
-        warn "worktree path already exists: $wt_path"
-    else
-        if git -C "$REPO_ROOT" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
-            info "checking out existing branch..."
-            git -C "$REPO_ROOT" worktree add "$wt_path" "$branch"
-        elif git -C "$REPO_ROOT" show-ref --verify --quiet "refs/remotes/origin/$branch" 2>/dev/null; then
-            info "checking out remote branch..."
-            git -C "$REPO_ROOT" worktree add "$wt_path" -b "$branch" "origin/$branch"
-        else
-            info "creating new branch..."
-            git -C "$REPO_ROOT" worktree add "$wt_path" -b "$branch"
-        fi
-    fi
-
-    # Submodule update (best effort — partial failure is OK)
-    info "initializing submodules..."
-    git -C "$wt_path" submodule update --init || warn "some submodules failed to init (continuing)"
-
-    # .wk directory
-    mkdir -p "$wt_path/.wk"
-
-    # Copy and modify docker-compose.yml
-    local src_compose="$REPO_ROOT/docker-compose.yml"
-    local dst_compose="$wt_path/.wk/docker-compose.yml"
-    [[ -f "$src_compose" ]] || die "docker-compose.yml not found in repo root"
-
-    local container_name port
-    container_name="$(container_name_for "$branch")"
-    port="$(ssh_port_for "$branch")"
-
-    info "container: $container_name, SSH port: $port"
-
-    cp "$src_compose" "$dst_compose"
-    # Replace compose project name
-    sed_i "s/^name: .*/name: $container_name/" "$dst_compose"
-    # Replace hostname
-    sed_i "s/hostname: .*/hostname: $sanitized/" "$dst_compose"
-    # Replace SSH port
-    sed_i "s/\"[0-9]*:22\"/\"$port:22\"/" "$dst_compose"
-    # Fix volumes: .:/workspace/ → wt_path:/workspace/
-    sed_i "s|- \.:/workspace/|- $wt_path:/workspace/|" "$dst_compose"
-    # Fix volumes: .cache/ → wt_path/.cache/
-    sed_i "s|- \.cache/:/cache/|- $wt_path/.cache/:/cache/|" "$dst_compose"
-
-    # Copy cache if requested
-    if $copy_cache && [[ -d "$REPO_ROOT/.cache" ]]; then
-        info "copying .cache from main worktree..."
-        mkdir -p "$wt_path/.cache"
-        cp -r "$REPO_ROOT/.cache/"* "$wt_path/.cache/" 2>/dev/null || true
-    fi
-
-    # Start container
-    info "starting container..."
-    docker compose -f "$dst_compose" up -d
-
-    # Checkout database submodule to same-named branch if it exists
-    if [[ -d "$wt_path/database" ]]; then
-        local db_remote_branch
-        db_remote_branch="$(git -C "$wt_path/database" ls-remote --heads origin "$branch" 2>/dev/null || true)"
-        if [[ -n "$db_remote_branch" ]]; then
-            info "checking out database/ to branch $branch..."
-            git -C "$wt_path/database" fetch origin "$branch" \
-                && git -C "$wt_path/database" checkout -B "$branch" "origin/$branch" \
-                || warn "failed to checkout database/ to $branch (continuing)"
-        fi
-    fi
-
-    touch_active "$wt_path"
-
-    echo ""
-    info "done! To enter the worktree:"
-    printf "  ${CYAN}cd %s${RESET}\n" "$wt_path"
-    printf "  ${CYAN}wk ssh${RESET}\n"
-
-    # Output for shell integration (auto-cd)
-    if [[ "${WK_SHELL_INTEGRATION:-}" == "1" ]]; then
-        echo "__wk_cd:$wt_path"
-    fi
-}
-
-cmd_rm() {
-    local force=false branch=""
-    while [[ $# -gt 0 ]]; do
-        case "$1" in
-            -f|--force) force=true; shift ;;
-            *) branch="$1"; shift ;;
-        esac
-    done
-
-    if [[ -n "$branch" ]]; then
-        local resolved
-        resolved="$(resolve_worktree_arg "$branch")"
-        [[ -n "$resolved" ]] && branch="$resolved"
-    else
-        branch="$(select_branch_fzf "rm")"
-    fi
-
-    local wt_path=""
-    while IFS=' ' read -r b p; do
-        [[ "$b" == "$branch" ]] && { wt_path="$p"; break; }
-    done < <(list_wk_worktrees)
-
-    [[ -z "$wt_path" ]] && die "worktree not found for branch: $branch"
-
-    # Safety check
-    if ! $force; then
-        local dirty=""
-        dirty="$(git -C "$wt_path" status --porcelain 2>/dev/null || true)"
-        if [[ -d "$wt_path/database" ]]; then
-            dirty+="$(git -C "$wt_path/database" status --porcelain 2>/dev/null || true)"
-        fi
-        if [[ -n "$dirty" ]]; then
-            warn "uncommitted changes in $branch:"
-            echo "$dirty" | head -20
-            die "use 'wk rm -f $branch' to force remove"
-        fi
-    fi
-
-    # Stop container
-    local cf
-    cf="$(compose_file_for "$wt_path")"
-    if [[ -f "$cf" ]]; then
-        info "stopping container..."
-        docker compose -f "$cf" down 2>/dev/null || true
-    fi
-
-    # Remove worktree
-    info "removing worktree..."
-    git -C "$REPO_ROOT" worktree remove "$wt_path" ${force:+--force} 2>/dev/null || {
-        if $force; then
-            warn "git worktree remove failed, removing directory..."
-            rm -rf "$wt_path"
-            git -C "$REPO_ROOT" worktree prune
-        else
-            die "failed to remove worktree (use -f to force)"
-        fi
-    }
-
-    info "removed: $branch"
-}
-
-cmd_ls() {
-    printf "${BOLD}%-20s %-30s %-10s %-6s %-6s %-4s %s${RESET}\n" \
-        "BRANCH" "CONTAINER" "STATUS" "SSH" "IDLE" "CI" "NOTE"
-
-    while IFS=' ' read -r branch wt_path; do
-        [[ -z "$branch" ]] && continue
-
-        local container_name status port idle ci note
-
-        container_name="$(container_name_for "$branch")"
-        status="$(container_status "$wt_path")"
-        port="$(get_ssh_port_from_compose "$wt_path")"
-
-        # Idle time
-        if [[ -f "$wt_path/.wk/last-active" ]]; then
-            local now last_active diff
-            now="$(date +%s)"
-            last_active="$(stat_mtime "$wt_path/.wk/last-active" || echo "$now")"
-            diff=$(( now - last_active ))
-            if (( diff < 60 )); then
-                idle="${diff}s"
-            elif (( diff < 3600 )); then
-                idle="$(( diff / 60 ))m"
-            elif (( diff < 86400 )); then
-                idle="$(( diff / 3600 ))h"
-            else
-                idle="$(( diff / 86400 ))d"
-            fi
-        else
-            idle="-"
-        fi
-
-        # CI status (best effort, don't block on errors)
-        ci="-"
-        if command -v gh &>/dev/null; then
-            local ci_result
-            ci_result="$(gh run list --branch "$branch" --limit 1 --json conclusion -q '.[0].conclusion' 2>/dev/null || true)"
-            case "$ci_result" in
-                success)  ci="✓" ;;
-                failure)  ci="✗" ;;
-                *)        ci="-" ;;
-            esac
-        fi
-
-        # Note from vars
-        note=""
-        if [[ -f "$wt_path/.wk/vars" ]]; then
-            note="$(grep '^note=' "$wt_path/.wk/vars" 2>/dev/null | cut -d= -f2- || true)"
-        fi
-
-        # Color status
-        local status_colored
-        case "$status" in
-            running) status_colored="${GREEN}${status}${RESET}" ;;
-            paused)  status_colored="${YELLOW}${status}${RESET}" ;;
-            *)       status_colored="${RED}${status}${RESET}" ;;
-        esac
-
-        printf "%-20s %-30s %-10b %-6s %-6s %-4s %s\n" \
-            "$branch" "$container_name" "$status_colored" "$port" "$idle" "$ci" "$note"
-    done < <(list_wk_worktrees)
-}
-
-cmd_ssh() {
-    local branch="$1"
-
-    if [[ -n "$branch" ]]; then
-        # Try fuzzy resolve (exact branch, sanitized, or container name)
-        local resolved
-        resolved="$(resolve_worktree_arg "$branch")"
-        [[ -n "$resolved" ]] && branch="$resolved"
-    else
-        branch="$(current_worktree_branch 2>/dev/null || true)"
-        [[ -z "$branch" ]] && branch="$(select_branch_fzf "ssh")"
-    fi
-
-    local wt_path=""
-    while IFS=' ' read -r b p; do
-        [[ "$b" == "$branch" ]] && { wt_path="$p"; break; }
-    done < <(list_wk_worktrees)
-
-    [[ -z "$wt_path" ]] && die "worktree not found for branch: $branch"
-
-    ensure_running "$wt_path"
-
-    local port
-    port="$(get_ssh_port_from_compose "$wt_path")"
-    wait_ssh_ready "$port"
-    touch_active "$wt_path"
-
-    ssh -o StrictHostKeyChecking=no -p "$port" root@localhost
-}
-
-cmd_exec() {
-    local branch="" cmd_args=()
-
-    # If first arg matches a known worktree branch, use it; otherwise assume current
-    if [[ $# -gt 0 ]]; then
-        local resolved
-        resolved="$(resolve_worktree_arg "$1")"
-        if [[ -n "$resolved" ]]; then
-            branch="$resolved"
-            shift
-        fi
-    fi
-
-    if [[ -z "$branch" ]]; then
-        branch="$(current_worktree_branch 2>/dev/null || true)"
-        [[ -z "$branch" ]] && die "not inside a wk worktree and no branch specified"
-    fi
-
-    cmd_args=("$@")
-    [[ ${#cmd_args[@]} -eq 0 ]] && die "usage: wk exec [branch] <command...>"
-
-    local wt_path=""
-    while IFS=' ' read -r b p; do
-        [[ "$b" == "$branch" ]] && { wt_path="$p"; break; }
-    done < <(list_wk_worktrees)
-
-    [[ -z "$wt_path" ]] && die "worktree not found for branch: $branch"
-
-    ensure_running "$wt_path"
-    touch_active "$wt_path"
-
-    local container_name
-    container_name="$(docker compose -f "$(compose_file_for "$wt_path")" ps -a --format '{{.Name}}' 2>/dev/null | head -1)"
-
-    if [[ -z "$container_name" ]]; then
-        container_name="$(container_name_for "$branch")"
-        local service_name
-        service_name="$(yq eval '.services | keys | .[0]' "$(compose_file_for "$wt_path")" 2>/dev/null || echo "vendor")"
-        container_name="${container_name}-${service_name}-1"
-    fi
-
-    docker exec -it "$container_name" bash -c "${cmd_args[*]}"
-}
-
-cmd_project_command() {
-    local cmd_name="$1"; shift
-    local cmd_str
-    cmd_str="$(yaml_get ".commands.${cmd_name} // \"\"")"
-    [[ -z "$cmd_str" || "$cmd_str" == "null" ]] && die "unknown command: $cmd_name (not in .wk.yaml commands)"
-    cmd_exec "$@" "$cmd_str"
-}
-
-cmd_var() {
-    local action="$1"; shift
-
-    local branch
-    branch="$(current_worktree_branch 2>/dev/null || true)"
-    [[ -z "$branch" ]] && die "not inside a wk worktree"
-
-    local wt_path=""
-    while IFS=' ' read -r b p; do
-        [[ "$b" == "$branch" ]] && { wt_path="$p"; break; }
-    done < <(list_wk_worktrees)
-
-    [[ -z "$wt_path" ]] && die "worktree not found for branch: $branch"
-
-    local vars_file="$wt_path/.wk/vars"
-
-    case "$action" in
-        set)
-            [[ $# -lt 2 ]] && die "usage: wk var set <key> <value>"
-            local key="$1" value="$2"
-            mkdir -p "$wt_path/.wk"
-            if [[ -f "$vars_file" ]] && grep -q "^${key}=" "$vars_file" 2>/dev/null; then
-                sed_i "s|^${key}=.*|${key}=${value}|" "$vars_file"
-            else
-                echo "${key}=${value}" >> "$vars_file"
-            fi
-            info "set $key=$value"
-            ;;
-        get)
-            [[ $# -lt 1 ]] && die "usage: wk var get <key>"
-            local key="$1"
-            if [[ -f "$vars_file" ]]; then
-                grep "^${key}=" "$vars_file" 2>/dev/null | cut -d= -f2- || true
-            fi
-            ;;
-        *)
-            die "usage: wk var <set|get> ..."
-            ;;
-    esac
-}
-
-cmd_watch() {
-    local action="${1:-start}"
-
-    local pid_file="$HOME/.wk/watch.pid"
-    local log_file="$HOME/.wk/watch.log"
-    mkdir -p "$HOME/.wk"
-
-    case "$action" in
-        stop)
-            if [[ -f "$pid_file" ]]; then
-                local pid
-                pid="$(cat "$pid_file")"
-                if kill -0 "$pid" 2>/dev/null; then
-                    kill "$pid"
-                    info "watch stopped (pid $pid)"
-                else
-                    warn "process $pid not running"
-                fi
-                rm -f "$pid_file"
-            else
-                warn "watch not running"
-            fi
-            ;;
-        status)
-            if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
-                info "watch running (pid $(cat "$pid_file"))"
-            else
-                info "watch not running"
-            fi
-            echo ""
-            printf "${BOLD}%-20s %-10s %-8s${RESET}\n" "BRANCH" "STATUS" "IDLE"
-            while IFS=' ' read -r branch wt_path; do
-                [[ -z "$branch" ]] && continue
-                local status idle
-                status="$(container_status "$wt_path")"
-                if [[ -f "$wt_path/.wk/last-active" ]]; then
-                    local now last_active diff
-                    now="$(date +%s)"
-                    last_active="$(stat_mtime "$wt_path/.wk/last-active" || echo "$now")"
-                    diff=$(( now - last_active ))
-                    if (( diff < 60 )); then idle="${diff}s"
-                    elif (( diff < 3600 )); then idle="$(( diff / 60 ))m"
-                    elif (( diff < 86400 )); then idle="$(( diff / 3600 ))h"
-                    else idle="$(( diff / 86400 ))d"
-                    fi
-                else
-                    idle="-"
-                fi
-                printf "%-20s %-10s %-8s\n" "$branch" "$status" "$idle"
-            done < <(list_wk_worktrees)
-            ;;
-        start|"")
-            if [[ -f "$pid_file" ]] && kill -0 "$(cat "$pid_file")" 2>/dev/null; then
-                die "watch already running (pid $(cat "$pid_file"))"
-            fi
-
-            local interval idle_timeout
-            interval="$(yaml_get '.watch.interval // "10m"')"
-            idle_timeout="$(yaml_get '.watch.idle_timeout // "4h"')"
-
-            info "starting watch (interval=${interval}, idle_timeout=${idle_timeout})"
-            info "log: $log_file"
-
-            local self
-            self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-            nohup "$self" _watch-loop "$REPO_ROOT" "$interval" "$idle_timeout" \
-                >> "$log_file" 2>&1 &
-            local bg_pid=$!
-            echo "$bg_pid" > "$pid_file"
-            disown
-
-            sleep 0.5
-            if kill -0 "$bg_pid" 2>/dev/null; then
-                info "watch started (pid $bg_pid)"
-            else
-                die "watch failed to start, check $log_file"
-            fi
-            ;;
-        *)
-            die "usage: wk watch [start|stop|status]"
-            ;;
-    esac
 }
 
 parse_duration() {
-    local input="$1"
-    local num="${input%[smhd]*}"
-    local unit="${input##*[0-9]}"
+    local input=${1:-0}
+    local num=${input%[smhd]} unit=${input##*[0-9]}
+    [[ "$num" =~ ^[0-9]+$ ]] || { printf '0'; return; }
     case "$unit" in
-        s|"") echo "$num" ;;
-        m)    echo $(( num * 60 )) ;;
-        h)    echo $(( num * 3600 )) ;;
-        d)    echo $(( num * 86400 )) ;;
-        *)    echo "$num" ;;
+        m) printf '%d' "$(( num * 60 ))" ;;
+        h) printf '%d' "$(( num * 3600 ))" ;;
+        d) printf '%d' "$(( num * 86400 ))" ;;
+        *) printf '%d' "$num" ;;
     esac
 }
 
+fmt_bytes() {
+    local b=${1:-0}
+    [[ "$b" =~ ^[0-9]+$ ]] || b=0
+    if   (( b >= 1073741824 )); then awk -v b="$b" 'BEGIN{printf "%.1fG", b/1073741824}'
+    elif (( b >= 1048576 ));    then awk -v b="$b" 'BEGIN{printf "%dM", b/1048576}'
+    elif (( b > 0 ));           then awk -v b="$b" 'BEGIN{printf "%dK", b/1024}'
+    else printf -- '-'
+    fi
+}
+
+# stat(1) is not portable: GNU uses -c, BSD/macOS uses -f. wk runs on the Linux
+# host, but its tests run on macOS runners too — and a silent "?" here would make
+# every ownership check fail closed.
+file_size()  { stat -c %s "$1" 2>/dev/null || stat -f %z "$1" 2>/dev/null || printf 0; }
+file_atime() { stat -c %X "$1" 2>/dev/null || stat -f %a "$1" 2>/dev/null || printf 0; }
+
+stat_owner() {
+    stat -c '%u:%g' "$1" 2>/dev/null || stat -f '%u:%g' "$1" 2>/dev/null || printf '?'
+}
+
+# Shorten a path to fit, cutting from the middle — head and tail carry the most
+# recognisable parts (the mount root and the repo name).
+elide() {
+    local str=$1 max=${2:-40}
+    (( max < 8 )) && max=8
+    if (( ${#str} <= max )); then printf '%s' "$str"; return; fi
+    local keep=$(( (max - 3) / 2 ))
+    printf '%s...%s' "${str:0:keep}" "${str: -$(( max - 3 - keep ))}"
+}
+
+# LXD instance names: letters/digits/dashes, must not start with a digit.
+valid_slot_name() {
+    local n=${1:-}
+    [[ ${#n} -ge 1 && ${#n} -le 63 ]] || return 1
+    [[ "$n" =~ ^[a-zA-Z][a-zA-Z0-9-]*$ ]] || return 1
+    return 0
+}
+
+# Pick the first candidate that is not in the existing list.
+# next_slot_name "<existing...>" "<candidates...>"
+next_slot_name() {
+    local existing=" ${1:-} " candidates=${2:-} c i
+    for c in $candidates; do
+        [[ "$existing" == *" $c "* ]] || { printf '%s' "$c"; return 0; }
+    done
+    for (( i = 1; i < 100; i++ )); do
+        c="wk$i"
+        [[ "$existing" == *" $c "* ]] || { printf '%s' "$c"; return 0; }
+    done
+    return 1
+}
+
+# anon + swap from a memory.stat body on stdin. $1 = swap bytes.
+mem_from_stat() {
+    local swap=${1:-0} anon
+    anon="$(awk '$1 == "anon" { print $2; exit }')"
+    [[ "$anon" =~ ^[0-9]+$ ]] || anon=0
+    [[ "$swap" =~ ^[0-9]+$ ]] || swap=0
+    printf '%d' "$(( anon + swap ))"
+}
+
+# Minimal YAML reader: the "- item" entries under a given top-level key.
+parse_list_key() {
+    local file=$1 key=$2
+    [[ -f "$file" ]] || return 0
+    awk -v key="$key" '
+        $0 ~ "^[[:space:]]*" key ":[[:space:]]*$" { inside = 1; next }
+        inside && /^[[:space:]]*-[[:space:]]*/ {
+            line = $0
+            sub(/^[[:space:]]*-[[:space:]]*/, "", line)
+            sub(/[[:space:]]*#.*$/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+            gsub(/^["'"'"']|["'"'"']$/, "", line)
+            if (line != "") print line
+            next
+        }
+        inside && /^[^[:space:]#]/ { inside = 0 }
+    ' "$file"
+}
+
+# --- Container queries --------------------------------------------------------
+slot_exists() {
+    lxc_ list "^$1\$" --format csv -c n 2>/dev/null | grep -qx "$1"
+}
+
+slot_state() {
+    lxc_ list "^$1\$" --format csv -c ns 2>/dev/null | awk -F, -v n="$1" '$1 == n { print $2; exit }'
+}
+
+all_slots() {
+    lxc_ list --format csv -c n 2>/dev/null | sed '/^$/d'
+}
+
+# Containers wk manages: tagged with user.wk.managed, or already carrying a
+# source device from the legacy scripts.
+managed_slots() {
+    local name
+    while read -r name; do
+        [[ -n "$name" ]] || continue
+        if [[ "$(meta_get "$name" managed)" == "1" ]] || source_device_of "$name" >/dev/null; then
+            printf '%s\n' "$name"
+        fi
+    done < <(all_slots)
+}
+
+require_slot() {
+    local name=${1:-}
+    [[ -n "$name" ]] || die "container name is required"
+    slot_exists "$name" || die "no such container: $name (see: wk ls)"
+}
+
+# --- Metadata in LXD (user.wk.*) ---------------------------------------------
+meta_get() {
+    lxc_ config get "$1" "user.wk.$2" 2>/dev/null || true
+}
+
+meta_set() {
+    lxc_ config set "$1" "user.wk.$2" "$3" 2>/dev/null || warn "could not record $2 on $1"
+}
+
+touch_active() { meta_set "$1" last-active "$(date +%s)"; }
+
+# --- Bound code directory -----------------------------------------------------
+# Print the device name currently holding the bound directory, if any.
+source_device_of() {
+    local name=$1 dev devices
+    devices="$(lxc_ config device list "$name" 2>/dev/null || true)"
+    for dev in "${WK_SOURCE_DEVICES[@]}"; do
+        grep -qx "$dev" <<<"$devices" && { printf '%s' "$dev"; return 0; }
+    done
+    return 1
+}
+
+bound_dir() {
+    local name=$1 dev
+    dev="$(source_device_of "$name")" || return 1
+    lxc_ config device get "$name" "$dev" source 2>/dev/null || return 1
+}
+
+# Which managed container (other than $2) already binds directory $1?
+bind_conflict() {
+    local dir=$1 skip=${2:-} name other
+    while read -r name; do
+        [[ -n "$name" && "$name" != "$skip" ]] || continue
+        other="$(bound_dir "$name" 2>/dev/null || true)"
+        [[ "$other" == "$dir" ]] && { printf '%s' "$name"; return 0; }
+    done < <(managed_slots)
+    return 1
+}
+
+# --- Memory -------------------------------------------------------------------
+slot_cgroup() {
+    local name=$1 p
+    for p in "/sys/fs/cgroup/lxc.payload.$name" \
+             "/sys/fs/cgroup/lxc.payload/$name" \
+             "/sys/fs/cgroup/lxc/$name"; do
+        [[ -d "$p" ]] && { printf '%s' "$p"; return 0; }
+    done
+    return 1
+}
+
+# Real (non-reclaimable) footprint: anon + swap. NOT memory.current, which
+# includes page cache and overstates usage by ~10x.
+slot_mem() {
+    local name=$1 cg swap
+    cg="$(slot_cgroup "$name")" || { printf '0'; return; }
+    swap="$(cat "$cg/memory.swap.current" 2>/dev/null || echo 0)"
+    mem_from_stat "$swap" < "$cg/memory.stat" 2>/dev/null || printf '0'
+}
+
+# Sample current usage and keep the high-water mark in LXD.
+sample_mem() {
+    local name=$1 now peak
+    now="$(slot_mem "$name")"
+    (( now > 0 )) || { printf '0'; return; }
+    peak="$(meta_get "$name" mem-peak)"
+    [[ "$peak" =~ ^[0-9]+$ ]] || peak=0
+    if (( now > peak )); then
+        meta_set "$name" mem-peak "$now"
+        peak=$now
+    fi
+    printf '%d' "$peak"
+}
+
+host_mem_available() {
+    awk '/^MemAvailable:/ { print $2 * 1024; exit }' /proc/meminfo 2>/dev/null || echo 0
+}
+
+# Warn (but do not block) when committing another container looks risky.
+capacity_check() {
+    local avail total=0 name peak budget
+    avail="$(host_mem_available)"
+    (( avail > 0 )) || return 0
+    while read -r name; do
+        [[ -n "$name" ]] || continue
+        peak="$(meta_get "$name" mem-peak)"
+        [[ "$peak" =~ ^[0-9]+$ ]] || peak=0
+        total=$(( total + peak ))
+    done < <(managed_slots)
+    budget=$(( avail * WK_MEM_SAFETY / 100 ))
+
+    if (( total > 0 && total > budget )); then
+        warn "memory looks tight before adding another container:"
+        printf '     existing peaks: %s   host available: %s   budget (%s%%): %s\n' \
+            "$(fmt_bytes "$total")" "$(fmt_bytes "$avail")" "$WK_MEM_SAFETY" "$(fmt_bytes "$budget")" >&2
+        while read -r name; do
+            [[ -n "$name" ]] || continue
+            printf '       %-14s peak %s\n' "$name" "$(fmt_bytes "$(meta_get "$name" mem-peak)")" >&2
+        done < <(managed_slots)
+    fi
+
+    local swap_total swap_free
+    swap_total="$(awk '/^SwapTotal:/ { print $2; exit }' /proc/meminfo 2>/dev/null || echo 0)"
+    swap_free="$(awk '/^SwapFree:/ { print $2; exit }' /proc/meminfo 2>/dev/null || echo 0)"
+    if (( swap_total > 0 && swap_free * 10 < swap_total )); then
+        warn "host swap is nearly exhausted ($(fmt_bytes $(( swap_free * 1024 ))) of $(fmt_bytes $(( swap_total * 1024 ))) free)"
+    fi
+}
+
+# --- Proxy egress -------------------------------------------------------------
+# The DOCKER-USER rules are not persistent, so re-assert them on every path
+# that needs the network instead of only at host-init time.
+proxy_endpoint() {
+    [[ -n "$WK_PROXY" ]] || return 1
+    local rest=${WK_PROXY#*://}
+    rest=${rest%%/*}; rest=${rest##*@}
+    local host port
+    if [[ "$rest" == \[*\]* ]]; then
+        host=${rest%%]*}; host=${host#[}; port=${rest##*:}
+    else
+        host=${rest%:*}; port=${rest##*:}
+    fi
+    [[ -n "$host" && "$port" =~ ^[0-9]+$ && "$host" != "$port" ]] || return 1
+    printf '%s %s' "$host" "$port"
+}
+
+egress_iface() {
+    local addr=${1%%/*} route
+    route="$(ip -4 route get "$addr" 2>/dev/null || true)"
+    [[ -n "$route" ]] || return 1
+    awk '{ for (i = 1; i < NF; i++) if ($i == "dev") { print $(i+1); exit } }' <<<"$route"
+}
+
+iptables_available() {
+    command -v iptables >/dev/null 2>&1 && iptables -S DOCKER-USER >/dev/null 2>&1
+}
+
+ensure_proxy_forwarding() {
+    local endpoint host port iface
+    endpoint="$(proxy_endpoint)" || return 0
+    read -r host port <<<"$endpoint"
+    iptables_available || return 0
+    iface="$(egress_iface "$host")" || return 0
+
+    local out=(-i lxdbr0 -o "$iface" -d "$host/32" -p tcp --dport "$port"
+               -m comment --comment wk-proxy-out -j ACCEPT)
+    local back=(-i "$iface" -o lxdbr0 -s "$host/32" -p tcp --sport "$port"
+                -m conntrack --ctstate ESTABLISHED,RELATED
+                -m comment --comment wk-proxy-return -j ACCEPT)
+
+    iptables -C DOCKER-USER "${out[@]}"  >/dev/null 2>&1 || iptables -I DOCKER-USER 1 "${out[@]}"
+    iptables -C DOCKER-USER "${back[@]}" >/dev/null 2>&1 || iptables -I DOCKER-USER 1 "${back[@]}"
+}
+
+# Let containers reach specific internal addresses without the proxy.
+ensure_direct_forwarding() {
+    local target dest iface
+    [[ -n "$WK_DIRECT_HOSTS" ]] || return 0
+    iptables_available || return 0
+
+    # shellcheck disable=SC2086  # WK_DIRECT_HOSTS is a space-separated list
+    for target in $WK_DIRECT_HOSTS; do
+        dest=$target
+        [[ "$dest" == */* ]] || dest="$dest/32"
+        iface="$(egress_iface "$target")" || { warn "no route to direct host $target"; continue; }
+
+        local out=(-i lxdbr0 -o "$iface" -d "$dest"
+                   -m comment --comment wk-direct-out -j ACCEPT)
+        local back=(-i "$iface" -o lxdbr0 -s "$dest"
+                    -m conntrack --ctstate ESTABLISHED,RELATED
+                    -m comment --comment wk-direct-return -j ACCEPT)
+
+        iptables -C DOCKER-USER "${out[@]}"  >/dev/null 2>&1 || iptables -I DOCKER-USER 1 "${out[@]}"
+        iptables -C DOCKER-USER "${back[@]}" >/dev/null 2>&1 || iptables -I DOCKER-USER 1 "${back[@]}"
+    done
+}
+
+# Both sets of rules are lost on host reboot, so assert them on every path that
+# needs the network rather than only at setup time.
+ensure_egress() {
+    ensure_proxy_forwarding
+    ensure_direct_forwarding
+}
+
+proxy_reachable_from() {
+    local name=$1 endpoint host port
+    endpoint="$(proxy_endpoint)" || return 0
+    read -r host port <<<"$endpoint"
+    lxc_ exec "$name" -- timeout 5 bash -c "</dev/tcp/$host/$port" >/dev/null 2>&1
+}
+
+# --- Running state ------------------------------------------------------------
+ensure_running() {
+    local name=$1 state
+    # Egress rules are lost on host reboot, and LXD brings containers back up on
+    # its own — so a container being RUNNING says nothing about the rules being
+    # there. Assert them on every path, not just when we start something.
+    ensure_egress
+    state="$(slot_state "$name")"
+    case "$state" in
+        RUNNING) return 0 ;;
+        FROZEN)
+            # LXD has no unfreeze command; `start` is what resumes a frozen instance.
+            step "thawing $name"
+            lxc_ start "$name"
+            ;;
+        STOPPED|"")
+            step "starting $name"
+            lxc_ start "$name"
+            wait_agent "$name"
+            ;;
+        *)
+            step "container state is $state, trying start"
+            lxc_ start "$name" || true
+            ;;
+    esac
+    [[ "$(slot_state "$name")" == RUNNING ]] || die "$name did not reach RUNNING"
+}
+
+wait_agent() {
+    local name=$1 i
+    for (( i = 0; i < 60; i++ )); do
+        lxc_ exec "$name" -- true >/dev/null 2>&1 && return 0
+        sleep 1
+    done
+    warn "$name is up but not accepting exec yet"
+}
+
+wait_docker() {
+    local name=$1 i
+    for (( i = 0; i < 60; i++ )); do
+        lxc_ exec "$name" -- docker info >/dev/null 2>&1 && return 0
+        sleep 2
+    done
+    return 1
+}
+
+# --- Services -----------------------------------------------------------------
+# Compose files are declared by the project itself, in .wk.yaml next to the code.
+# wk deliberately knows nothing about any particular project's layout.
+service_files() {
+    local dir=$1 f
+    while read -r f; do
+        [[ -n "$f" ]] || continue
+        printf '%s\n' "$f"
+    done < <(parse_list_key "$dir/.wk.yaml" services)
+}
+
+smoke_services() {
+    local dir=$1 s
+    while read -r s; do
+        [[ -n "$s" ]] || continue
+        printf '%s\n' "$s"
+    done < <(parse_list_key "$dir/.wk.yaml" smoke_services)
+}
+
+networks_for() {
+    local dir=$1 n found=0
+    while read -r n; do
+        [[ -n "$n" ]] || continue
+        found=1
+        printf '%s\n' "$n"
+    done < <(parse_list_key "$dir/.wk.yaml" networks)
+    (( found )) && return 0
+    # shellcheck disable=SC2086  # WK_NETWORKS is a space-separated list
+    for n in $WK_NETWORKS; do printf '%s\n' "$n"; done
+}
+
+services_up() {
+    local name=$1 dir files nets
+    dir="$(bound_dir "$name")" || { warn "$name has no code bound; nothing to start"; return 0; }
+    files="$(service_files "$dir")"
+    [[ -n "$files" ]] || { step "no compose files declared for $dir"; return 0; }
+
+    wait_docker "$name" || die "Docker daemon is not up in $name"
+    nets="$(networks_for "$dir")"
+
+    info "starting services in $name"
+    lxc_ exec "$name" -- bash -s "$dir" "$nets" "$files" <<'GUEST'
+set -Eeuo pipefail
+dir=$1; nets=$2; files=$3
+for n in $nets; do
+    docker network create "$n" >/dev/null 2>&1 || true
+done
+while read -r f; do
+    [[ -n "$f" ]] || continue
+    [[ -f "$dir/$f" ]] || { echo "missing compose file: $dir/$f" >&2; exit 1; }
+    docker compose -f "$dir/$f" config -q
+    # --pull never: images are provisioned by `wk warm`, so a missing one should
+    # fail fast instead of silently going out to the network.
+    docker compose -f "$dir/$f" up -d --pull never --quiet-pull
+done <<<"$files"
+docker ps --format '{{.Names}}\t{{.Status}}'
+GUEST
+}
+
+services_down() {
+    local name=$1 dir files
+    dir="$(bound_dir "$name")" || return 0
+    files="$(service_files "$dir")"
+    [[ -n "$files" ]] || return 0
+    step "stopping services in $name"
+    lxc_ exec "$name" -- bash -s "$dir" "$files" <<'GUEST'
+set -Eeuo pipefail
+dir=$1; files=$2
+# Reverse order so dependents go down first.
+tac <<<"$files" | while read -r f; do
+    [[ -n "$f" && -f "$dir/$f" ]] || continue
+    docker compose -f "$dir/$f" down || true
+done
+GUEST
+}
+
+# --- Commands: ls -------------------------------------------------------------
+cmd_ls() {
+    local name state dir note idle mem last now
+    now="$(date +%s)"
+
+    # Measure the widest name and path first: a fixed %-38s pushed NOTE off screen
+    # as soon as a real bind path (55 chars here) showed up.
+    local name_w=4 code_w=4 _n _d
+    while read -r _n; do
+        [[ -n "$_n" ]] || continue
+        (( ${#_n} > name_w )) && name_w=${#_n}
+        _d="$(bound_dir "$_n" 2>/dev/null || echo '-')"
+        (( ${#_d} > code_w )) && code_w=${#_d}
+    done < <(managed_slots)
+
+    # Keep the whole row inside the terminal; the middle of a path is the least
+    # informative part, so that is what gets elided.
+    local cols=${COLUMNS:-$(tput cols 2>/dev/null || echo 100)}
+    local budget=$(( cols - name_w - 9 - 6 - 7 - 8 ))
+    (( budget < 20 )) && budget=20
+    (( code_w > budget )) && code_w=$budget
+
+    printf "%s%-${name_w}s %-9s %-6s %-7s %-${code_w}s %s%s\n" \
+        "$BOLD" NAME STATE IDLE MEM CODE NOTE "$RESET"
+
+    local any=0
+    while read -r name; do
+        [[ -n "$name" ]] || continue
+        any=1
+        state="$(slot_state "$name")"
+        dir="$(bound_dir "$name" 2>/dev/null || echo '-')"
+        note="$(meta_get "$name" note)"
+        last="$(meta_get "$name" last-active)"
+        if [[ "$last" =~ ^[0-9]+$ ]]; then
+            idle="$(fmt_duration "$(( now - last ))")"
+        else
+            idle='-'
+        fi
+        if [[ "$state" == RUNNING ]]; then
+            mem="$(fmt_bytes "$(sample_mem "$name")")"
+        else
+            mem="$(fmt_bytes "$(meta_get "$name" mem-peak)")"
+        fi
+
+        # Pad before colouring so escape codes do not break column alignment.
+        local padded colored
+        printf -v padded '%-9s' "${state:-?}"
+        case "$state" in
+            RUNNING) colored="${GREEN}${padded}${RESET}" ;;
+            FROZEN)  colored="${CYAN}${padded}${RESET}" ;;
+            STOPPED) colored="${YELLOW}${padded}${RESET}" ;;
+            *)       colored="${RED}${padded}${RESET}" ;;
+        esac
+
+        printf "%-${name_w}s %s %-6s %-7s %-${code_w}s %s\n" \
+            "$name" "$colored" "$idle" "$mem" "$(elide "${dir:--}" "$code_w")" "$note"
+    done < <(managed_slots)
+
+    (( any )) || printf '%s(no wk-managed containers — create one with: wk new)%s\n' "$DIM" "$RESET"
+}
+
+# --- Commands: new / rm -------------------------------------------------------
+ensure_host() {
+    need_cmd "$WK_LXC"
+    need_cmd ip
+    lxc_ info >/dev/null 2>&1 || die "LXD is not reachable (is it installed and initialised?)"
+    mkdir -p "$WK_DATA_ROOT" "$WK_IMAGE_CACHE"
+    if ! lxc_ storage show "$WK_POOL" >/dev/null 2>&1; then
+        info "creating storage pool $WK_POOL at $WK_DATA_ROOT/lxd-storage"
+        mkdir -p "$WK_DATA_ROOT/lxd-storage"
+        lxc_ storage create "$WK_POOL" dir "source=$WK_DATA_ROOT/lxd-storage"
+    fi
+    ensure_egress
+}
+
+apply_slot_config() {
+    local name=$1 key want have i running=0 needs_restart=0
+    [[ "$(slot_state "$name")" == RUNNING ]] && running=1
+
+    # These five are what makes a nested Docker daemon work. They cannot be
+    # changed while the instance runs, so only report a mismatch there.
+    local -a pairs=(
+        security.privileged                 true
+        security.nesting                    true
+        security.syscalls.intercept.mknod   true
+        security.syscalls.intercept.setxattr true
+        raw.lxc                             lxc.apparmor.profile=unconfined
+    )
+    for (( i = 0; i < ${#pairs[@]}; i += 2 )); do
+        key=${pairs[i]}; want=${pairs[i + 1]}
+        have="$(lxc_ config get "$name" "$key" 2>/dev/null || true)"
+        [[ "$have" == "$want" ]] && continue
+        if (( running )); then
+            warn "$name: $key is '${have:-unset}' but must be '$want'"
+            needs_restart=1
+        else
+            lxc_ config set "$name" "$key" "$want"
+        fi
+    done
+
+    if [[ -n "$WK_PROXY" ]]; then
+        for key in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; do
+            lxc_ config set "$name" "environment.$key" "$WK_PROXY"
+        done
+    fi
+    lxc_ config set "$name" environment.NO_PROXY "$WK_NO_PROXY"
+    lxc_ config set "$name" environment.no_proxy "$WK_NO_PROXY"
+    lxc_ config set "$name" user.wk.managed 1
+
+    (( needs_restart )) && warn "restart to apply: wk stop $name && wk start $name"
+    return 0
+}
+
+install_docker() {
+    local name=$1
+    info "installing Docker in $name"
+    lxc_ exec "$name" -- bash -s <<'GUEST'
+set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+# The proxy is intermittently flaky; a single apt failure should not cost a
+# whole container build.
+retry() {
+    local i
+    for i in 1 2 3 4 5; do
+        "$@" && return 0
+        echo "  attempt $i/5 failed: $* — retrying in 20s" >&2
+        sleep 20
+    done
+    echo "  giving up after 5 attempts: $*" >&2
+    return 1
+}
+
+deadline=$(( SECONDS + 90 ))
+until ip -4 route show default >/dev/null 2>&1 && getent hosts archive.ubuntu.com >/dev/null 2>&1; do
+    (( SECONDS < deadline )) || { echo "guest network never came up" >&2; exit 1; }
+    sleep 1
+done
+
+proxy="${HTTP_PROXY:-${http_proxy:-${HTTPS_PROXY:-${https_proxy:-}}}}"
+if [[ -n "$proxy" ]]; then
+    install -d /etc/apt/apt.conf.d
+    printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "$proxy" "$proxy" \
+        > /etc/apt/apt.conf.d/95-wk-proxy
+fi
+
+retry apt-get update
+if apt-cache show docker-compose-v2 >/dev/null 2>&1; then
+    compose_pkg=docker-compose-v2
+elif apt-cache show docker-compose-plugin >/dev/null 2>&1; then
+    compose_pkg=docker-compose-plugin
+else
+    echo "no Docker Compose v2 package available" >&2
+    exit 1
+fi
+retry apt-get install -y docker.io "$compose_pkg" git openssh-client ca-certificates curl jq tmux
+
+if [[ -n "$proxy" ]]; then
+    install -d /etc/systemd/system/docker.service.d
+    {
+        echo "[Service]"
+        for var in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
+            val="${!var:-}"
+            [[ -n "$val" ]] || continue
+            val="${val//\\/\\\\}"; val="${val//\"/\\\"}"
+            printf 'Environment="%s=%s"\n' "$var" "$val"
+        done
+    } > /etc/systemd/system/docker.service.d/proxy.conf
+
+    # Docker CLI injects these into every `docker run`, which is the only way a
+    # build container gets a proxy when the project's Makefile does not pass one
+    # (a project's build rule typically does not). Without it, anything the build
+    # downloads — conan packages, for instance — cannot leave the container.
+    #
+    # noProxy here is deliberately minimal: the slot's own NO_PROXY excludes
+    # private ranges, but the internal registry and artifact repo live on one of
+    # those ranges and are only reachable *through* the proxy.
+    install -d /root/.docker
+    cat > /root/.docker/config.json <<JSON
+{
+  "proxies": {
+    "default": {
+      "httpProxy": "$proxy",
+      "httpsProxy": "$proxy",
+      "noProxy": "localhost,127.0.0.1,::1"
+    }
+  }
+}
+JSON
+fi
+
+systemctl daemon-reload
+systemctl enable --now docker
+systemctl restart docker
+docker info >/dev/null
+docker compose version >/dev/null
+GUEST
+}
+
+install_tools() {
+    local name=$1
+    info "installing tools in $name"
+    lxc_ exec "$name" -- bash -s <<'GUEST'
+set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+retry() {
+    local i
+    for i in 1 2 3 4 5; do
+        "$@" && return 0
+        echo "  attempt $i/5 failed: $* — retrying in 20s" >&2
+        sleep 20
+    done
+    echo "  giving up after 5 attempts: $*" >&2
+    return 1
+}
+
+# --no-install-recommends matters a lot here: `npm` recommends node-gyp, which
+# drags in gcc, python and even X11 packages — measured at 566 packages / 172 MB
+# on a real build. The agent CLIs are pure JS and need none of it.
+retry apt-get update
+retry apt-get install -y --no-install-recommends \
+    git openssh-client ca-certificates curl jq tmux nodejs npm
+apt-cache show gh   >/dev/null 2>&1 && apt-get install -y --no-install-recommends gh   || true
+apt-cache show glab >/dev/null 2>&1 && apt-get install -y --no-install-recommends glab || true
+GUEST
+
+    # Copying the host's global node_modules is much faster than npm install and
+    # pins the same agent version the host runs. npm is the fallback.
+    local pkgs=()
+    [[ -d /usr/lib/node_modules/@openai/codex ]] && pkgs+=(@openai/codex)
+    [[ -d /usr/lib/node_modules/@anthropic-ai/claude-code ]] && pkgs+=(@anthropic-ai/claude-code)
+    if (( ${#pkgs[@]} )); then
+        step "copying agent CLIs from host: ${pkgs[*]}"
+        lxc_ exec "$name" -- mkdir -p /usr/lib/node_modules
+        tar -C /usr/lib/node_modules -cpf - "${pkgs[@]}" \
+            | lxc_ exec "$name" -- tar -C /usr/lib/node_modules -xpf -
+    else
+        step "no host codex/claude packages to copy — will install with npm"
+    fi
+
+    lxc_ exec "$name" -- bash -s <<'GUEST'
+set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive
+
+link_bin() {
+    local bin=$1; shift
+    local cand
+    for cand in "$@"; do
+        [[ -f "$cand" ]] || continue
+        ln -sf "$cand" "/usr/bin/$bin"
+        return 0
+    done
+    return 1
+}
+
+link_bin codex /usr/lib/node_modules/@openai/codex/bin/codex.js || true
+link_bin claude /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe \
+                /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude \
+                /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js || true
+
+command -v codex  >/dev/null 2>&1 || { echo "installing codex via npm";  npm install -g @openai/codex; }
+command -v claude >/dev/null 2>&1 || { echo "installing claude via npm"; npm install -g @anthropic-ai/claude-code; }
+
+for c in codex claude; do
+    command -v "$c" >/dev/null 2>&1 || echo "WARN: $c is still missing after install" >&2
+done
+GUEST
+}
+
+# Report whether a container is actually usable. Machine-friendly: non-zero exit
+# when something an agent would depend on is missing.
+verify_slot() {
+    local name=$1 failed=0
+
+    if lxc_ exec "$name" -- docker info >/dev/null 2>&1; then
+        ok "docker daemon"
+    else
+        bad "docker daemon not responding"; failed=1
+    fi
+
+    local c
+    for c in codex claude gh glab git tmux; do
+        if lxc_ exec "$name" -- bash -lc "command -v $c >/dev/null 2>&1"; then
+            ok "$c"
+        else
+            case "$c" in
+                codex|claude|git) bad "$c missing"; failed=1 ;;
+                *)                hint "$c missing (optional)" ;;
+            esac
+        fi
+    done
+
+    if lxc_ exec "$name" -- bash -lc '[[ -s /root/.codex/auth.json || -s /root/.claude/.credentials.json ]]'; then
+        ok "agent credentials present"
+    else
+        bad "no agent credentials — run: wk auth $name (after logging in on the host)"; failed=1
+    fi
+
+    if proxy_endpoint >/dev/null; then
+        if proxy_reachable_from "$name"; then
+            ok "proxy reachable from inside"
+        else
+            bad "proxy NOT reachable from inside"; failed=1
+        fi
+    fi
+
+    return $(( failed ))
+}
+
+seed_auth() {
+    local name=$1 paths=()
+    local home=${WK_AUTH_HOME:-${HOME:-/root}}
+    [[ -n "$home" && -d "$home" ]] || home=/root
+
+    local p
+    for p in .codex/auth.json .codex/config.toml .claude.json \
+             .claude/.credentials.json .claude/settings.json \
+             .claude/remote-settings.json .claude/policy-limits.json \
+             .gitconfig; do
+        [[ -f "$home/$p" ]] && paths+=("$p")
+    done
+    for p in .config/gh .config/glab-cli .ssh; do
+        [[ -d "$home/$p" ]] && paths+=("$p")
+    done
+    (( ${#paths[@]} )) || { warn "nothing to seed from $home"; return 0; }
+
+    info "seeding credentials into $name (treat this container as trusted)"
+    tar -C "$home" -cpf - "${paths[@]}" | lxc_ exec "$name" -- tar -C /root -xpf -
+    lxc_ exec "$name" -- bash -lc '
+set +e
+[[ -d /root/.ssh ]] && chmod 700 /root/.ssh
+for f in /root/.codex/auth.json /root/.codex/config.toml /root/.claude.json \
+         /root/.claude/.credentials.json /root/.claude/remote-settings.json \
+         /root/.claude/policy-limits.json /root/.config/gh/hosts.yml \
+         /root/.config/glab-cli/config.yml; do
+    [[ -f "$f" ]] && chmod 600 "$f"
+done
+[[ -d /root/.ssh ]] && find /root/.ssh -type f ! -name "*.pub" -exec chmod 600 {} +
+true
+'
+}
+
+warm_images() {
+    local name=$1
+    [[ -n "$WK_WARM_IMAGES" ]] || { step "WK_WARM_IMAGES is empty — skipping image warm-up"; return 0; }
+    command -v docker >/dev/null 2>&1 || { warn "no docker on host — skipping image warm-up"; return 0; }
+    wait_docker "$name" || die "Docker daemon is not up in $name"
+    mkdir -p "$WK_IMAGE_CACHE"
+
+    local image tar_name tar_path
+    # shellcheck disable=SC2086  # WK_WARM_IMAGES is a space-separated list
+    for image in $WK_WARM_IMAGES; do
+        tar_name="${image//\//_}"; tar_name="${tar_name//:/__}"; tar_name="${tar_name//@/_}.tar"
+        tar_path="$WK_IMAGE_CACHE/$tar_name"
+
+        if [[ "${WK_REFRESH_IMAGE_CACHE:-0}" == 1 || ! -s "$tar_path" ]]; then
+            if ! docker image inspect "$image" >/dev/null 2>&1; then
+                step "pulling on host: $image"
+                docker pull "$image" || { warn "cannot pull $image — skipping"; continue; }
+            fi
+            step "caching $image"
+            docker image save -o "$tar_path" "$image"
+        fi
+
+        step "loading into $name: $image"
+        lxc_ file push "$tar_path" "$name/tmp/$tar_name" >/dev/null
+        lxc_ exec "$name" -- docker image load -i "/tmp/$tar_name" >/dev/null
+        lxc_ exec "$name" -- rm -f "/tmp/$tar_name"
+    done
+}
+
+cmd_new() {
+    local name=${1:-}
+    ensure_host
+
+    if [[ -z "$name" ]]; then
+        name="$(next_slot_name "$(all_slots | tr '\n' ' ')" "$WK_SLOTS")" \
+            || die "could not pick a free container name"
+        info "picked name: $name"
+    fi
+    valid_slot_name "$name" || die "invalid container name: $name (letters, digits, dashes; must start with a letter)"
+    lock_slot "$name" x
+
+    capacity_check
+
+    if slot_exists "$name"; then
+        info "$name exists — re-running setup (idempotent)"
+    else
+        info "creating $name from $WK_IMAGE on pool $WK_POOL"
+        lxc_ init "$WK_IMAGE" "$name" --storage "$WK_POOL"
+    fi
+
+    apply_slot_config "$name"
+    ensure_running "$name"
+
+    if ! lxc_ exec "$name" -- docker info >/dev/null 2>&1; then
+        install_docker "$name"
+    else
+        step "Docker already present"
+    fi
+    install_tools "$name"
+    seed_auth "$name"
+    warm_images "$name"
+    touch_active "$name"
+
+    printf '\n%sverifying %s%s\n' "$BOLD" "$name" "$RESET"
+    local ready=0
+    verify_slot "$name" || ready=1
+
+    printf '\n'
+    printf '  bind code:  %swk bind %s /path/to/your/clone --chown%s\n' "$CYAN" "$name" "$RESET"
+    printf '  go inside:  %swk enter %s%s\n' "$CYAN" "$name" "$RESET"
+
+    if (( ready )); then
+        warn "$name was built but is not fully usable — see the failed checks above"
+        return 1
+    fi
+    info "$name is ready"
+    audit "new $name"
+}
+
+cmd_rm() {
+    local force=false name=''
+    while (( $# )); do
+        case "$1" in
+            -f|--force) force=true; shift ;;
+            *) name=$1; shift ;;
+        esac
+    done
+    require_slot "$name"
+    lock_slot "$name" x
+
+    local dir
+    dir="$(bound_dir "$name" 2>/dev/null || true)"
+
+    if ! $force; then
+        [[ -t 0 ]] || die "refusing to delete $name without confirmation — re-run with -f"
+        printf 'Delete container %s%s%s?' "$BOLD" "$name" "$RESET"
+        [[ -n "$dir" ]] && printf ' (code at %s is NOT touched)' "$dir"
+        printf ' [y/N] '
+        local reply=''
+        read -r reply || true
+        [[ "$reply" == [yY]* ]] || die "aborted"
+    fi
+
+    services_down "$name" || true
+    lxc_ delete --force "$name"
+    info "deleted container $name"
+    audit "rm $name"
+    if [[ -n "$dir" ]]; then
+        info "code left untouched: $dir"
+    fi
+}
+
+# --- Commands: bind -----------------------------------------------------------
+cmd_bind() {
+    local no_up=false do_chown=false name='' dir=''
+    while (( $# )); do
+        case "$1" in
+            --no-up)  no_up=true; shift ;;
+            --chown)  do_chown=true; shift ;;
+            *) if [[ -z "$name" ]]; then name=$1; else dir=$1; fi; shift ;;
+        esac
+    done
+    require_slot "$name"
+    lock_slot "$name" x
+    [[ -n "$dir" ]] || die "usage: wk bind <container> <dir> [--chown] [--no-up]"
+
+    [[ -d "$dir" ]] || die "not a directory: $dir"
+    dir="$(cd "$dir" && pwd)"        # normalise to an absolute, symlink-free path
+
+    local holder
+    if holder="$(bind_conflict "$dir" "$name")"; then
+        die "$dir is already bound to $holder — unbind it first (wk unbind $holder)"
+    fi
+
+    # The compile image runs as uid 1000; the tree must be writable by it.
+    # Never silently produce an unusable environment: either fix it, or fail loudly.
+    local owner
+    owner="$(stat_owner "$dir")"
+    if [[ "$owner" != "$WK_CODE_UID:$WK_CODE_GID" ]]; then
+        if $do_chown; then
+            info "chown -R $WK_CODE_UID:$WK_CODE_GID $dir"
+            chown -R "$WK_CODE_UID:$WK_CODE_GID" "$dir"
+        elif [[ -t 0 ]]; then
+            warn "$dir is owned by $owner, but builds run as $WK_CODE_UID:$WK_CODE_GID"
+            printf '  chown -R %s:%s %s now? [y/N] ' "$WK_CODE_UID" "$WK_CODE_GID" "$dir"
+            local reply=''
+            read -r reply || true
+            [[ "$reply" == [yY]* ]] || die "aborted — builds could not write into $dir"
+            chown -R "$WK_CODE_UID:$WK_CODE_GID" "$dir"
+            info "ownership fixed"
+        else
+            die "$dir is owned by $owner but builds run as $WK_CODE_UID:$WK_CODE_GID — re-run with --chown"
+        fi
+    fi
+
+    ensure_running "$name"
+
+    # Path-identical mount: same absolute path inside the container, so build
+    # artefacts and debug paths match the host.
+    local dev existing
+    dev="$(source_device_of "$name" || printf '%s' "${WK_SOURCE_DEVICES[0]}")"
+    existing="$(bound_dir "$name" 2>/dev/null || true)"
+    if [[ -n "$existing" ]]; then
+        if [[ "$existing" == "$dir" ]]; then
+            step "already bound: $dir"
+        else
+            info "rebinding $name: $existing -> $dir"
+            services_down "$name" || true
+            lxc_ config device remove "$name" "$dev"
+            existing=''
+        fi
+    fi
+
+    if [[ -z "$existing" ]]; then
+        lxc_ exec "$name" -- mkdir -p "$(dirname "$dir")"
+        lxc_ config device add "$name" "$dev" disk source="$dir" path="$dir" >/dev/null
+        info "bound $dir into $name (read-write, same path)"
+    audit "bind $name $dir"
+    fi
+
+    # Stable entry point regardless of which directory is bound.
+    # Only ever replace a symlink or a missing path — never a real directory.
+    lxc_ exec "$name" -- bash -lc \
+        "if [[ -L /code || ! -e /code ]]; then rm -f /code; ln -s $(printf '%q' "$dir") /code; fi" || true
+    touch_active "$name"
+
+    $no_up && return 0
+    services_up "$name"
+}
+
+cmd_unbind() {
+    local name=${1:-}
+    require_slot "$name"
+    lock_slot "$name" x
+    local dev dir
+    dir="$(bound_dir "$name" 2>/dev/null || true)"
+    if ! dev="$(source_device_of "$name")"; then
+        info "$name has no code bound"
+        return 0
+    fi
+    services_down "$name" || true
+    lxc_ config device remove "$name" "$dev" >/dev/null
+    [[ "$(slot_state "$name")" == RUNNING ]] && lxc_ exec "$name" -- rm -f /code 2>/dev/null || true
+    info "unbound $dir from $name (code left untouched)"
+    audit "unbind $name $dir"
+}
+
+# --- Commands: enter / exec ---------------------------------------------------
+cmd_enter() {
+    local name=${1:-} agent=${2:-}
+    require_slot "$name"
+    lock_slot "$name" s
+    [[ -z "$agent" || "$agent" == codex || "$agent" == claude || "$agent" == shell ]] \
+        || die "usage: wk enter <container> [codex|claude]"
+
+    ensure_running "$name"
+    touch_active "$name"
+
+    local dir guest
+    dir="$(bound_dir "$name" 2>/dev/null || echo /root)"
+
+    if [[ -n "$agent" && "$agent" != shell ]]; then
+        lxc_ exec "$name" -- bash -lc "command -v $agent >/dev/null" \
+            || die "$agent is not installed in $name (run: wk new $name)"
+        printf -v guest 'cd %q 2>/dev/null || cd /root; %s; exec bash -l' "$dir" "$agent"
+    else
+        printf -v guest 'cd %q 2>/dev/null || cd /root; exec bash -l' "$dir"
+    fi
+
+    # Keep the tmux session on the host: it survives the container being
+    # frozen, restarted, or rebound.
+    if command -v tmux >/dev/null 2>&1 && [[ "${WK_TMUX:-1}" == 1 ]]; then
+        local session="wk-$name${agent:+-$agent}" cmd
+        printf -v cmd '%q exec %q -- bash -lc %q' "$WK_LXC" "$name" "$guest"
+        if [[ -n "${TMUX:-}" ]]; then
+            tmux has-session -t "$session" 2>/dev/null || tmux new-session -d -s "$session" "$cmd"
+            exec tmux switch-client -t "$session"
+        fi
+        exec tmux new-session -A -s "$session" "$cmd"
+    fi
+
+    exec "$WK_LXC" exec "$name" -- bash -lc "$guest"
+}
+
+cmd_exec() {
+    local retry=0
+    while [[ "${1:-}" == --retry ]]; do retry=${2:-0}; shift 2; done
+
+    local name=${1:-}
+    require_slot "$name"; shift
+    lock_slot "$name" s
+    (( $# )) || die "usage: wk exec [--retry N] <container> <cmd...>"
+    ensure_running "$name"
+    touch_active "$name"
+    local dir
+    dir="$(bound_dir "$name" 2>/dev/null || echo /root)"
+    local guest="cd $(printf '%q' "$dir") 2>/dev/null || cd /root; $*"
+
+    # Retry is opt-in: exec runs arbitrary commands and many are not idempotent.
+    # Only the caller knows whether this is a safely re-runnable incremental build.
+    local attempt=0 rc=0
+    while :; do
+        lxc_ exec "$name" -- bash -lc "$guest" && return 0
+        rc=$?
+        (( attempt >= retry )) && return "$rc"
+        attempt=$(( attempt + 1 ))
+        warn "command failed (rc=$rc) — retry $attempt/$retry in $(( attempt * 5 ))s"
+        sleep $(( attempt * 5 ))
+    done
+}
+
+cmd_dexec() {
+    local name=${1:-}
+    require_slot "$name"; shift
+    lock_slot "$name" s
+    local container=${1:-}
+    [[ -n "$container" ]] || die "usage: wk dexec <container> <docker-container> <cmd...>"
+    shift
+    (( $# )) || die "usage: wk dexec <container> <docker-container> <cmd...>"
+    ensure_running "$name"
+    touch_active "$name"
+    lxc_ exec "$name" -- docker exec -i "$container" bash -lc "$*"
+}
+
+# --- Commands: power ----------------------------------------------------------
+cmd_pause() {
+    local name=${1:-}
+    require_slot "$name"
+    lock_slot "$name" x
+    [[ "$(slot_state "$name")" == RUNNING ]] || { info "$name is not running"; return 0; }
+    lxc_ pause "$name"
+    info "froze $name — processes stay in memory, any access thaws it"
+    audit "pause $name"
+}
+
+cmd_start() {
+    local name=${1:-}
+    require_slot "$name"
+    lock_slot "$name" x
+    ensure_running "$name"
+    touch_active "$name"
+    info "$name is running"
+}
+
+cmd_stop() {
+    local name=${1:-}
+    require_slot "$name"
+    lock_slot "$name" x
+    local state
+    state="$(slot_state "$name")"
+    [[ "$state" == STOPPED ]] && { info "$name is already stopped"; return 0; }
+    warn "stopping $name discards processes inside it (tmux sessions, running builds)"
+    services_down "$name" || true
+    lxc_ stop "$name"
+    info "stopped $name — memory released, code binding kept"
+    audit "stop $name"
+}
+
+# --- Commands: auth / warm / services ----------------------------------------
+cmd_auth() {
+    local name=${1:-} count=0
+    if [[ -n "$name" ]]; then
+        require_slot "$name"
+        lock_slot "$name" x
+        ensure_running "$name"
+        seed_auth "$name"
+        audit "auth $name"
+        return 0
+    fi
+    while read -r name; do
+        [[ -n "$name" ]] || continue
+        [[ "$(slot_state "$name")" == RUNNING ]] || { step "skipping $name (not running)"; continue; }
+        seed_auth "$name"
+        count=$(( count + 1 ))
+    done < <(managed_slots)
+    (( count )) || warn "no running containers to seed"
+}
+
+cache_total() {
+    local f total=0
+    for f in "$WK_IMAGE_CACHE"/*.tar; do
+        [[ -f "$f" ]] || continue
+        total=$(( total + $(file_size "$f") ))
+    done
+    printf '%d' "$total"
+}
+
+cmd_cache() {
+    local action=${1:-ls} f
+    case "$action" in
+    ls)
+        [[ -d "$WK_IMAGE_CACHE" ]] || { info "no cache directory yet: $WK_IMAGE_CACHE"; return 0; }
+        printf '%s%-52s %8s  %s%s\n' "$BOLD" TAR SIZE "LAST USED" "$RESET"
+        local any=0
+        for f in "$WK_IMAGE_CACHE"/*.tar; do
+            [[ -f "$f" ]] || continue
+            any=1
+            printf '%-52s %8s  %s\n' "$(elide "$(basename "$f")" 52)" \
+                "$(fmt_bytes "$(file_size "$f")")" \
+                "$(fmt_duration "$(( $(date +%s) - $(file_atime "$f") ))") ago"
+        done
+        (( any )) || hint "cache is empty"
+        printf '%stotal %s (limit %sG)%s\n' "$DIM" "$(fmt_bytes "$(cache_total)")" "$WK_CACHE_MAX_GB" "$RESET"
+        ;;
+    prune)
+        cache_prune
+        ;;
+    *) die "usage: wk cache <ls|prune>" ;;
+    esac
+}
+
+# Keep the newest tars up to the limit and drop the rest. Tars are a
+# regenerable accelerator, never the only copy of anything — so LRU is safe.
+cache_prune() {
+    [[ -d "$WK_IMAGE_CACHE" ]] || return 0
+    local max=$(( WK_CACHE_MAX_GB * 1024 * 1024 * 1024 ))
+    local listing running=0 atime size path freed=0
+    listing="$(
+        for path in "$WK_IMAGE_CACHE"/*.tar; do
+            [[ -f "$path" ]] || continue
+            printf '%s %s %s\n' "$(file_atime "$path")" "$(file_size "$path")" "$path"
+        done | sort -rn
+    )"
+    [[ -n "$listing" ]] || return 0
+
+    while read -r atime size path; do
+        [[ -n "${path:-}" ]] || continue
+        running=$(( running + size ))
+        if (( running > max )); then
+            step "pruning $(basename "$path") ($(fmt_bytes "$size"))"
+            rm -f "$path" && freed=$(( freed + size ))
+        fi
+    done <<< "$listing"
+
+    (( freed > 0 )) && info "freed $(fmt_bytes "$freed"); cache now $(fmt_bytes "$(cache_total)")"
+    return 0
+}
+
+# Stream an image straight from one container to another: no tar on disk, no
+# network, and the host does not need to hold the image at all.
+copy_images_between() {
+    local src=$1 dst=$2; shift 2
+    local images=("$@") image
+    (( ${#images[@]} )) || images=($WK_WARM_IMAGES)
+    (( ${#images[@]} )) || die "no images given and WK_WARM_IMAGES is empty"
+
+    for image in "${images[@]}"; do
+        step "copying $image: $src -> $dst"
+        lxc_ exec "$src" -- docker save "$image" | lxc_ exec "$dst" -- docker load >/dev/null \
+            || die "failed to copy $image from $src"
+    done
+    info "copied ${#images[@]} image(s) from $src into $dst"
+}
+
+cmd_warm() {
+    local name='' from='' images=()
+    while (( $# )); do
+        case "$1" in
+            --from) from=${2:-}; shift 2 ;;
+            *) if [[ -z "$name" ]]; then name=$1; else images+=("$1"); fi; shift ;;
+        esac
+    done
+    require_slot "$name"
+    lock_slot "$name" x
+    ensure_running "$name"
+
+    if [[ -n "$from" ]]; then
+        require_slot "$from"
+        ensure_running "$from"
+        copy_images_between "$from" "$name" "${images[@]+"${images[@]}"}"
+        audit "warm $name --from $from"
+        return 0
+    fi
+
+    warm_images "$name"
+    cache_prune
+    audit "warm $name"
+}
+
+cmd_up() {
+    local name=${1:-}
+    require_slot "$name"
+    lock_slot "$name" x
+    ensure_running "$name"
+    touch_active "$name"
+    services_up "$name"
+}
+
+cmd_down() {
+    local name=${1:-}
+    require_slot "$name"
+    lock_slot "$name" x
+    [[ "$(slot_state "$name")" == RUNNING ]] || { info "$name is not running"; return 0; }
+    services_down "$name"
+    info "services stopped in $name"
+    audit "down $name"
+}
+
+cmd_smoke() {
+    local name=${1:-}
+    require_slot "$name"
+    lock_slot "$name" s
+    ensure_running "$name"
+    local dir names nets
+    dir="$(bound_dir "$name")" || die "$name has no code bound"
+    names="$(smoke_services "$dir")"
+    [[ -n "$names" ]] || die "no smoke_services declared in $dir/.wk.yaml — nothing to check"
+    nets="$(networks_for "$dir" | head -1)"
+
+    info "smoke test in $name"
+    lxc_ exec "$name" -- bash -s "$names" "$nets" "$dir" "$WK_CODE_UID:$WK_CODE_GID" <<'GUEST'
+set -Eeuo pipefail
+names=$1; net=$2; dir=$3; owner=$4
+flat="$(tr '\n' ' ' <<<"$names")"
+
+while read -r n; do
+    [[ -n "$n" ]] || continue
+    [[ "$(docker inspect -f '{{.State.Running}}' "$n" 2>/dev/null)" == true ]] \
+        || { echo "not running: $n" >&2; exit 1; }
+    if [[ -n "$net" ]]; then
+        docker inspect -f '{{json .NetworkSettings.Networks}}' "$n" | grep -q "$net" \
+            || { echo "$n is not on network $net" >&2; exit 1; }
+    fi
+done <<<"$names"
+echo "PASS services running"
+
+probe="$(head -1 <<<"$names")"
+docker cp /etc/hosts "$probe:/tmp/wk-probe"
+docker exec "$probe" test -s /tmp/wk-probe
+docker cp "$probe:/tmp/wk-probe" /tmp/wk-probe.out
+test -s /tmp/wk-probe.out
+rm -f /tmp/wk-probe.out
+docker exec "$probe" rm -f /tmp/wk-probe
+echo "PASS docker exec + docker cp"
+
+if docker image inspect busybox:1.36 >/dev/null 2>&1; then
+    if [[ -n "$net" ]]; then
+        # shellcheck disable=SC2086
+        docker run --rm --network "$net" busybox:1.36 sh -c \
+            'for h in "$@"; do nslookup "$h" 127.0.0.11 >/dev/null || exit 1; done' _ $flat
+        echo "PASS in-network DNS"
+    fi
+    # Verify the write the same way the compile image does it: as uid 1000.
+    if docker run --rm -u "$owner" -v "$dir:/w" busybox:1.36 \
+            sh -c 'touch /w/.wk-write-probe && rm -f /w/.wk-write-probe'; then
+        echo "PASS code dir writable as $owner"
+    else
+        echo "FAIL code dir not writable as $owner — builds will fail" >&2
+        exit 1
+    fi
+else
+    echo "SKIP DNS and write checks (busybox:1.36 not present)"
+fi
+GUEST
+}
+
+# Is this container actually usable? Exits non-zero if not — meant to be called
+# by scripts and agents before handing work to it.
+cmd_verify() {
+    local name=${1:-}
+    require_slot "$name"
+    ensure_running "$name"
+    printf '%s%s%s\n' "$BOLD" "$name" "$RESET"
+    local dir
+    if dir="$(bound_dir "$name" 2>/dev/null)"; then
+        ok "code bound: $dir"
+    else
+        hint "no code bound (wk bind $name <dir>)"
+    fi
+    verify_slot "$name"
+}
+
+cmd_note() {
+    local name=${1:-}
+    require_slot "$name"; shift
+    if (( $# )); then
+        meta_set "$name" note "$*"
+        info "note set on $name"
+    else
+        meta_get "$name" note
+    fi
+}
+
+# --- Commands: doctor ---------------------------------------------------------
+ok()   { printf '  %s✓%s %s\n' "$GREEN" "$RESET" "$*"; }
+bad()  { printf '  %s✗%s %s\n' "$RED" "$RESET" "$*"; DOCTOR_FAILED=1; }
+hint() { printf '  %s·%s %s\n' "$DIM" "$RESET" "$*"; }
+
+cmd_doctor() {
+    local fix=false
+    while (( $# )); do
+        case "$1" in
+            --fix) fix=true; shift ;;
+            *) die "usage: wk doctor [--fix]" ;;
+        esac
+    done
+    DOCTOR_FAILED=0
+
+    printf '%shost%s\n' "$BOLD" "$RESET"
+    if command -v "$WK_LXC" >/dev/null 2>&1 && lxc_ info >/dev/null 2>&1; then
+        ok "LXD reachable ($(lxc_ version 2>/dev/null | awk -F': ' '/Server/ {print $2; exit}'))"
+    else
+        bad "LXD not reachable — install/init it, or set WK_LXC"
+    fi
+
+    if lxc_ storage show "$WK_POOL" >/dev/null 2>&1; then
+        local driver
+        driver="$(lxc_ storage show "$WK_POOL" 2>/dev/null | awk '/^driver:/ { print $2; exit }')"
+        ok "storage pool $WK_POOL exists (${driver:-unknown} driver)"
+    else
+        bad "storage pool $WK_POOL missing — wk new will create it"
+    fi
+
+    local avail swap_total swap_free
+    avail="$(host_mem_available)"
+    swap_total="$(awk '/^SwapTotal:/ { print $2 * 1024; exit }' /proc/meminfo 2>/dev/null || echo 0)"
+    swap_free="$(awk '/^SwapFree:/ { print $2 * 1024; exit }' /proc/meminfo 2>/dev/null || echo 0)"
+    hint "memory available: $(fmt_bytes "$avail")"
+    if (( swap_total > 0 && swap_free * 10 < swap_total )); then
+        bad "swap nearly exhausted: $(fmt_bytes "$swap_free") of $(fmt_bytes "$swap_total") free"
+    else
+        ok "swap: $(fmt_bytes "$swap_free") of $(fmt_bytes "$swap_total") free"
+    fi
+
+    printf '%sproxy egress%s\n' "$BOLD" "$RESET"
+    local endpoint host port iface
+    if endpoint="$(proxy_endpoint)"; then
+        read -r host port <<<"$endpoint"
+        hint "proxy: $WK_PROXY"
+        if iface="$(egress_iface "$host")"; then
+            ok "host route to $host via $iface"
+        else
+            bad "no host route to proxy $host"
+        fi
+        if command -v iptables >/dev/null 2>&1 && iptables -S DOCKER-USER >/dev/null 2>&1; then
+            if iptables -S DOCKER-USER 2>/dev/null | grep -q 'wk-proxy-out'; then
+                ok "DOCKER-USER forwarding rules present (they do not survive a host reboot)"
+            elif $fix; then
+                ensure_egress
+                if iptables -S DOCKER-USER 2>/dev/null | grep -q wk-proxy-out; then
+                    ok "DOCKER-USER forwarding rules installed"
+                else
+                    bad "could not install DOCKER-USER forwarding rules"
+                fi
+            else
+                bad "DOCKER-USER forwarding rules missing — containers cannot reach the proxy (fix: wk doctor --fix)"
+            fi
+        else
+            hint "no DOCKER-USER chain — skipping forwarding check"
+        fi
+    else
+        hint "no proxy configured (WK_PROXY empty)"
+    fi
+
+    if [[ -n "$WK_DIRECT_HOSTS" ]]; then
+        local target
+        # shellcheck disable=SC2086
+        for target in $WK_DIRECT_HOSTS; do
+            # iptables prints -d before the comment, so match the two independently.
+            if iptables_available && iptables -S DOCKER-USER 2>/dev/null \
+                    | grep -- 'wk-direct-out' | grep -qF "${target%%/*}"; then
+                ok "direct egress allowed to $target"
+            elif $fix; then
+                ensure_direct_forwarding
+                ok "direct egress rules installed for $target"
+            else
+                bad "direct egress to $target missing — tools that ignore the proxy will fail (fix: wk doctor --fix)"
+            fi
+        done
+    fi
+
+    if [[ -n "$WK_PROBE_URLS" ]]; then
+        if command -v curl >/dev/null 2>&1; then
+            local url code proxy_arg
+            # shellcheck disable=SC2086
+            for url in $WK_PROBE_URLS; do
+                if [[ -n "$WK_PROXY" ]]; then
+                    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 -x "$WK_PROXY" "$url" 2>/dev/null || printf '000')"
+                else
+                    code="$(curl -sS -o /dev/null -w '%{http_code}' --max-time 15 "$url" 2>/dev/null || printf '000')"
+                fi
+                if [[ "$code" =~ ^[23] ]]; then
+                    ok "fetch $url -> $code"
+                else
+                    bad "fetch $url -> $code — builds pulling from here will fail"
+                fi
+            done
+        else
+            hint "curl unavailable — skipping fetch probes"
+        fi
+    else
+        hint "no fetch probes configured (set WK_PROBE_URLS to catch a half-broken proxy)"
+    fi
+
+    printf '%scontainers%s\n' "$BOLD" "$RESET"
+    local any=0 name state key val dir owner
+    while read -r name; do
+        [[ -n "$name" ]] || continue
+        any=1
+        state="$(slot_state "$name")"
+        printf '  %s%s%s (%s)\n' "$BOLD" "$name" "$RESET" "$state"
+
+        for key in security.privileged security.nesting \
+                   security.syscalls.intercept.mknod security.syscalls.intercept.setxattr; do
+            val="$(lxc_ config get "$name" "$key" 2>/dev/null || true)"
+            if [[ "$val" == true ]]; then
+                ok "$key"
+            else
+                bad "$key is '${val:-unset}' — nested Docker needs true"
+            fi
+        done
+
+        dir="$(bound_dir "$name" 2>/dev/null || true)"
+        if [[ -z "$dir" ]]; then
+            hint "no code bound"
+        elif [[ ! -d "$dir" ]]; then
+            bad "bound directory is gone: $dir"
+        else
+            owner="$(stat_owner "$dir")"
+            if [[ "$owner" == "$WK_CODE_UID:$WK_CODE_GID" ]]; then
+                ok "code $dir owned by $owner"
+            else
+                bad "code $dir owned by $owner, builds run as $WK_CODE_UID:$WK_CODE_GID"
+            fi
+        fi
+
+        if [[ "$state" == RUNNING ]]; then
+            if lxc_ exec "$name" -- docker info >/dev/null 2>&1; then
+                ok "Docker daemon up"
+            else
+                bad "Docker daemon not responding"
+            fi
+            if proxy_endpoint >/dev/null; then
+                if proxy_reachable_from "$name"; then
+                    ok "proxy reachable from inside"
+                else
+                    bad "proxy NOT reachable from inside — apt/docker pulls will hang"
+                fi
+            fi
+            if [[ -n "$WK_DIRECT_HOSTS" ]]; then
+                local dtarget
+                # shellcheck disable=SC2086
+                for dtarget in $WK_DIRECT_HOSTS; do
+                    if lxc_ exec "$name" -- timeout 5 bash -c "</dev/tcp/${dtarget%%/*}/${WK_DIRECT_PROBE_PORT:-443}" >/dev/null 2>&1; then
+                        ok "direct route to $dtarget works from inside"
+                    else
+                        bad "cannot reach $dtarget from inside — tools that ignore the proxy will fail"
+                    fi
+                done
+            fi
+            # sample_mem also refreshes the high-water mark, so the two never disagree.
+            local mem_now mem_peak
+            mem_now="$(slot_mem "$name")"
+            mem_peak="$(sample_mem "$name")"
+            hint "memory (anon+swap): $(fmt_bytes "$mem_now"), peak $(fmt_bytes "$mem_peak")"
+        fi
+    done < <(managed_slots)
+    (( any )) || hint "no wk-managed containers yet"
+
+    printf '\n'
+    if (( DOCTOR_FAILED )); then
+        printf '%sdoctor found problems%s\n' "$RED" "$RESET"
+        return 1
+    fi
+    printf '%sall checks passed%s\n' "$GREEN" "$RESET"
+}
+
+# --- Help ---------------------------------------------------------------------
 cmd_help() {
-    cat <<'EOF'
-wk — worktree isolation development tool
+    cat <<EOF
+wk $WK_VERSION — LXD container manager for isolated dev/CI environments
 
-Usage: wk <command> [args]
+Each container runs its own Docker daemon, so fixed service/network names can
+coexist across containers. Code is a plain host directory you clone yourself;
+wk only mounts it.
 
-Environment lifecycle:
-  new <branch|pr:NNN> [--copy-cache]   Create worktree + container
-  rm  [-f] [branch]                    Remove worktree + container
-  ls                                   List all worktrees
+Everyday:
+  wk ls                        list containers: state / idle / memory / code / note
+  wk enter <c> [codex|claude]  go inside (thaws or starts it first)
 
-Environment operations:
-  ssh  [branch]            SSH into container (auto-wake)
-  exec [branch] <cmd...>  Execute command in container
+Code:
+  wk bind <c> <dir> [--chown] [--no-up]
+                               mount a code directory (same path inside) + start services
+                               --chown fixes ownership to $WK_CODE_UID:$WK_CODE_GID
+  wk unbind <c>                unmount it (code is left untouched)
 
-Project commands (from .wk.yaml):
-  build                    Build in container
-  deploy                   Deploy GP cluster
-  test                     Run tests
-  <custom>                 Any command defined in .wk.yaml
+Power:
+  wk pause <c>                 freeze — processes stay in memory, instant resume
+  wk stop <c>                  stop — frees memory, loses processes inside
+  wk start <c>                 start
 
-Metadata:
-  var set <key> <value>    Set per-worktree variable
-  var get <key>            Get per-worktree variable
+Setup (rare):
+  wk new [name]                build a container: Docker, tools, credentials, images
+  wk rm [-f] <c>               delete a container (never touches your code)
+  wk doctor [--fix]            check LXD, proxy egress, memory, container config
+  wk auth [c]                  re-seed credentials after logging in again on the host
 
-Monitoring:
-  watch [start]            Start idle-container monitor
-  watch stop               Stop monitor
-  watch status             Show monitor status
+Troubleshooting:
+  wk exec [--retry N] <c> <cmd...>
+                               run a command inside the container
+  wk dexec <c> <docker> <cmd>  run a command inside one of its Docker containers
+  wk up|down <c>               start/stop project services only
+  wk verify <c>                is it usable? docker, agent CLIs, credentials, proxy
+  wk smoke <c>                 verify services, DNS, docker exec/cp, write access
+  wk warm <c> [--from <src>]   load cached images, or stream them from another container
+  wk cache ls|prune            list / LRU-trim the host image cache
+  wk note <c> [text]           get/set the note shown in wk ls
 
+Config: $WK_CONFIG (shell vars; environment overrides)
+  WK_POOL WK_DATA_ROOT WK_IMAGE WK_SLOTS WK_WARM_IMAGES WK_NETWORKS
+  WK_CODE_UID WK_CODE_GID WK_MEM_SAFETY WK_PROXY WK_NO_PROXY
+
+Note: containers are privileged (required for nested Docker). Treat them as a
+trusted local environment, not as a multi-tenant security boundary.
 EOF
 }
 
-# --- Main dispatch ---
-cmd="${1:-help}"
-shift || true
+# --- Dispatch -----------------------------------------------------------------
+main() {
+    local cmd=${1:-help}
+    shift || true
+    case "$cmd" in
+        ls|list)        cmd_ls "$@" ;;
+        enter|shell)    cmd_enter "$@" ;;
+        bind)           cmd_bind "$@" ;;
+        unbind)         cmd_unbind "$@" ;;
+        pause|freeze)   cmd_pause "$@" ;;
+        stop)           cmd_stop "$@" ;;
+        start|thaw)     cmd_start "$@" ;;
+        new|create)     cmd_new "$@" ;;
+        rm|delete)      cmd_rm "$@" ;;
+        doctor)         cmd_doctor "$@" ;;
+        auth)           cmd_auth "$@" ;;
+        exec)           cmd_exec "$@" ;;
+        dexec)          cmd_dexec "$@" ;;
+        up)             cmd_up "$@" ;;
+        down)           cmd_down "$@" ;;
+        smoke)          cmd_smoke "$@" ;;
+        warm)           cmd_warm "$@" ;;
+        cache)          cmd_cache "$@" ;;
+        verify)         cmd_verify "$@" ;;
+        note)           cmd_note "$@" ;;
+        version|--version) printf 'wk %s\n' "$WK_VERSION" ;;
+        help|-h|--help) cmd_help ;;
+        *)              cmd_help >&2; die "unknown command: $cmd" ;;
+    esac
+}
 
-# Commands that don't need repo context
-case "$cmd" in
-    help|-h|--help) cmd_help; exit 0 ;;
-    _watch-loop)
-        # Internal: daemon loop called by `wk watch start`
-        # Args: <repo_root> <interval> <idle_timeout>
-        REPO_ROOT="$1"; _interval="$2"; _idle_timeout="$3"
-        _interval_s="$(parse_duration "$_interval")"
-        _idle_timeout_s="$(parse_duration "$_idle_timeout")"
-        while true; do
-            while IFS=' ' read -r _branch _wt_path; do
-                [[ -z "$_branch" ]] && continue
-                _status="$(container_status "$_wt_path")"
-                if [[ "$_status" == "running" && -f "$_wt_path/.wk/last-active" ]]; then
-                    _now="$(date +%s)"
-                    _last="$(stat_mtime "$_wt_path/.wk/last-active" || echo "$_now")"
-                    _diff=$(( _now - _last ))
-                    if (( _diff > _idle_timeout_s )); then
-                        echo "$(date): pausing $_branch (idle ${_diff}s)"
-                        docker compose -f "$(compose_file_for "$_wt_path")" pause 2>/dev/null || true
-                    fi
-                fi
-            done < <(list_wk_worktrees)
-            sleep "$_interval_s"
-        done
-        exit 0
-        ;;
-esac
-
-# All other commands need repo context
-require_repo
-
-case "$cmd" in
-    new)    cmd_new "$@" ;;
-    rm)     cmd_rm "$@" ;;
-    ls)     cmd_ls ;;
-    ssh)    cmd_ssh "${1:-}" ;;
-    exec)   cmd_exec "$@" ;;
-    var)    cmd_var "$@" ;;
-    watch)  cmd_watch "${1:-start}" ;;
-    *)
-        # Check if it's a project command from .wk.yaml
-        cmd_str="$(yaml_get ".commands.${cmd} // \"\"" 2>/dev/null || true)"
-        if [[ -n "$cmd_str" && "$cmd_str" != "null" ]]; then
-            cmd_project_command "$cmd" "$@"
-        else
-            die "unknown command: $cmd (try 'wk help')"
-        fi
-        ;;
-esac
+# Allow test harnesses to source the helpers without running a command.
+[[ "${WK_SOURCE_ONLY:-0}" == 1 ]] || main "$@"

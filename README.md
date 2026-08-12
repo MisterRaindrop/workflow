@@ -1,162 +1,209 @@
 # wk
 
-A CLI tool for managing isolated development environments using git worktrees and Docker Compose.
+Manage long-lived LXD containers for isolated development and CI.
 
-Each worktree gets its own container with a unique SSH port, automatic wake-on-access, and idle monitoring.
+Each container runs **its own Docker daemon**, so services with fixed names —
+`shared-ci-net`, `mysql`, `services-hive` — can exist in several containers
+at once without colliding. Your code is a plain directory on the host that you
+clone yourself; `wk` only mounts it.
 
-## Prerequisites
+> **Trust boundary:** containers are privileged (`security.privileged`,
+> `security.nesting`, apparmor unconfined) because a nested Docker daemon needs it.
+> Treat them as a **trusted local environment**, not as a multi-tenant security
+> boundary.
 
-- bash 4+
-- git
-- docker compose v2
-- [yq](https://github.com/mikefarah/yq) (YAML parsing)
-- [fzf](https://github.com/junegunn/fzf) (interactive selection, optional)
-- [gh](https://cli.github.com/) (GitHub CLI, optional — for `pr:NNN` and CI status)
+## Why
+
+CI scripts hard-code service, network, and volume names. If every task shares the
+host's Docker daemon, two tasks fight over the same `shared-ci-net` network
+and the same `mysql` container. Renaming is not an option — the names live in the
+CI scripts. So the isolation boundary has to sit at the Docker daemon itself:
+
+```
+lxslot1 ──▶ docker ──▶ shared-ci-net / mysql / hive  ┐
+lxslot2 ──▶ docker ──▶ shared-ci-net / mysql / hive  ├ same names, invisible to each other
+lxslot3 ──▶ docker ──▶ shared-ci-net / mysql / hive  ┘
+```
+
+## Model
+
+```
+container (long-lived, built once, reused across tasks)
+   └── one bound code directory (swap it whenever you like)
+```
+
+There is no "task" object. **The container is the unit of work** — to work on three
+things, use three containers. What a container is currently doing is simply the
+directory it has bound plus a note.
+
+All state lives in LXD: container state comes from `lxc list`, the bound directory
+from its disk device, notes and timers from `user.wk.*` config keys. wk keeps no
+state files of its own.
+
+## Requirements
+
+- an LXD host (tested on 5.21 LTS) — wk runs **on** that host, normally as root
+- `git`, `iptables` (only if you go through a proxy), `tmux` (optional, for `wk enter`)
+- `docker` on the host only if you want image warm-up
 
 ## Install
 
 ```bash
-git clone https://github.com/liuxiaoyu/workflow.git
+git clone https://github.com/MisterRaindrop/workflow.git
 cd workflow
-./install.sh
+./install.sh                 # symlinks wk, seeds /etc/wk/config.env
 ```
 
-This symlinks `wk` into `~/.local/bin`. Pass a custom path if needed:
+Then review the config and check the host:
 
 ```bash
-./install.sh /usr/local/bin
+$EDITOR /etc/wk/config.env
+wk doctor
 ```
 
-For auto-cd after `wk new`, add the shell function printed by `install.sh` to your `~/.zshrc` or `~/.bashrc`.
+## Quick start
 
-## Setup
-
-Create a `.wk.yaml` in your project root:
-
-```yaml
-# Where to create worktrees (optional, this is the default)
-# Available variables:
-#   {{ repo_path }}          — absolute path of the main repo
-#   {{ repo }}               — directory name of the main repo
-#   {{ branch | sanitize }}  — branch name with / replaced by -
-path: "{{ repo_path }}/../{{ repo }}-{{ branch | sanitize }}"
-
-# Custom commands — each entry becomes `wk <name>`
-# Add as many as you need. The command runs inside the container via docker exec.
-commands:
-  build:   "make -j$(nproc)"
-  test:    "make test"
-  deploy:  "scripts/deploy.sh"
-  lint:    "npm run lint"
-  migrate: "python manage.py migrate"
-  # wk build   → docker exec <container> bash -c "make -j$(nproc)"
-  # wk lint    → docker exec <container> bash -c "npm run lint"
-  # ... any name works
-
-# Auto-pause idle containers (optional)
-# Requires `wk watch` to be running in the background.
-watch:
-  interval: 10m        # how often to check
-  idle_timeout: 4h     # pause containers idle longer than this
-```
-
-Your `docker-compose.yml` needs no changes. `wk new` copies it, then patches the project name, hostname, and SSH port automatically.
-
-## Quick Start
+Build a container once — this is the slow part (Docker, tools, credentials, images):
 
 ```bash
-# Create an isolated environment for a branch
-wk new feature/my-work
+wk new                       # or: wk new lxslot1
+```
 
-# List all environments
+Then bind code and go:
+
+```bash
+git clone <repo> /data/src/fix-auth-bug     # you prepare the code
+wk bind lxslot1 /data/src/fix-auth-bug      # mounts it, starts project services
+wk enter lxslot1                            # inside; add `codex` or `claude` to launch one
+```
+
+Day to day it is just:
+
+```bash
 wk ls
+wk enter lxslot1
+```
 
-# SSH into the container
-wk ssh
+From your laptop, in one line:
 
-# Run a project command inside the container
-wk build
-wk test
-
-# Run any ad-hoc command inside the container (no .wk.yaml needed)
-wk exec make clean          # → docker exec <container> bash -c "make clean"
-
-# Remove when done
-wk rm feature/my-work
+```bash
+mosh --ssh="ssh -i ~/.ssh/id_rsa" root@<host> -- wk enter lxslot1
 ```
 
 ## Commands
 
-### Environment Lifecycle
+### Everyday
 
 ```bash
-wk new <branch>           # Create worktree + start container
-wk new pr:123             # Create from a GitHub PR
-wk new feat --copy-cache  # Copy .cache/ from main worktree
-wk rm [branch]            # Stop container + remove worktree
-wk rm -f [branch]         # Force remove (skip uncommitted check)
+wk ls                          # state / idle / memory / bound code / note
+wk enter <c> [codex|claude]    # go inside — thaws or starts the container first
 ```
 
-### Environment Operations
+### Code
 
 ```bash
-wk ls                     # List all worktrees with status
-wk ssh [branch]           # SSH into container (auto-wakes)
-wk exec [branch] <cmd>    # Run ad-hoc command inside container (auto-wakes)
+wk bind <c> <dir> [--no-up]    # mount a directory at the same path inside, start services
+wk unbind <c>                  # unmount (your code is never touched)
 ```
 
-### Project Commands
+`bind` mounts the directory at the **same absolute path** inside the container, so
+build artefacts and debug paths match the host. It also checks the directory is
+owned by `WK_CODE_UID:WK_CODE_GID` (1000:1000 by default), because builds run as
+that user and cannot write otherwise. `/code` inside the container always points at
+whatever is currently bound.
 
-Any key you add under `commands:` in `.wk.yaml` becomes a `wk` subcommand:
+### Power
+
+```bash
+wk pause <c>                   # freeze: processes stay in memory, instant resume
+wk start <c>                   # start (also what resumes a frozen container)
+wk stop  <c>                   # stop: frees memory, loses processes inside
+```
+
+Prefer `pause`. It keeps your tmux sessions and half-finished builds alive and
+resumes instantly; it just does not give memory back.
+
+### Setup
+
+```bash
+wk new [name]                  # build a container (idempotent — safe to re-run)
+wk rm [-f] <c>                 # delete a container; never touches your code
+wk doctor                      # LXD, storage pool, proxy egress, memory, per-container config
+wk auth [c]                    # re-seed credentials after logging in again on the host
+```
+
+Credentials are **copied** into each container, not shared. After you log in again
+on the host (`codex`, `claude`, `gh`, …), run `wk auth`. A single writable
+`~/.codex` shared across containers would corrupt itself.
+
+### Troubleshooting
+
+```bash
+wk exec [--retry N] <c> <cmd>  # run a command in the container
+wk dexec <c> <docker> <cmd>    # run a command in one of its Docker containers
+wk up|down <c>                 # start/stop project services only
+wk smoke <c>                   # services, in-network DNS, docker exec/cp, write access
+wk warm <c> [--from <src>]     # load cached images, or stream them from another container
+wk cache ls|prune              # list / LRU-trim the host image cache
+wk note <c> [text]             # get/set the note shown in wk ls
+```
+
+`wk exec` runs in the **container**; `wk dexec` runs inside one of the Docker
+containers within it. Two layers, two commands.
+
+## Concurrency
+
+Commands take a per-container lock. `exec` and `enter` take a *shared* one, so
+several long jobs can overlap; anything that mutates the container (`bind`,
+`stop`, `rm`, …) takes an *exclusive* one and will wait, then fail with a message
+naming the container. This is what stops a `bind` from pulling the mount out from
+under a running build.
+
+Every write operation is recorded to journald — `journalctl -t wk`.
+
+## Per-project services
+
+Without any config, wk looks for the project layout (`services/mysql.yml` and the
+two `docker-compose-*-ci.yml` files). To be explicit, drop a `.wk.yaml` in your
+code directory:
 
 ```yaml
-# .wk.yaml
-commands:
-  build:   "make -j$(nproc)"
-  test:    "make test"
-  lint:    "npm run lint"
-  migrate: "python manage.py migrate"
+services:
+  - services/mysql.yml
+  - scripts/functions/docker-compose/docker-compose-ci.yml
+
+networks:
+  - shared-ci-net
+
+smoke_services:
+  - mysql
+  - services-hive
 ```
 
-```bash
-wk build      # → docker exec <container> bash -c "make -j$(nproc)"
-wk lint       # → docker exec <container> bash -c "npm run lint"
-wk migrate    # → docker exec <container> bash -c "python manage.py migrate"
-```
+## Capacity
 
-Add as many commands as you like. The name is yours to choose — `wk` looks it up in `.wk.yaml` at runtime.
+`wk ls` samples each container's real memory footprint and records the high-water
+mark; `wk new` warns before committing another container.
 
-### Metadata
+The number to watch is **anon + swap**, not `memory.current`. The latter includes
+page cache — on a real container it read 13.3 GiB while the non-reclaimable
+footprint was 1.4 GiB, a ~10x overstatement that would wrongly tell you the host is
+full.
 
-```bash
-wk var set note "fixing auth bug"   # Attach a note (shown in wk ls)
-wk var get note                     # Read it back
-```
+## Notes on the design
 
-### Monitoring
+- **Images are per-container.** They change over time, and sharing a Docker daemon
+  directory across containers is never safe. Host-side tar caching means the bytes
+  are downloaded once and loaded from disk into each container.
+- **No git worktrees.** A worktree shares `.git` and submodule state with the main
+  checkout, which is a permanent source of interference. Independent clones are what
+  make a container and its code truly decoupled.
+- **Proxy forwarding rules are not persistent.** wk re-asserts the `DOCKER-USER`
+  rules on every path that needs the network, and `wk doctor` verifies the proxy is
+  actually reachable from inside a container.
 
-```bash
-wk watch                  # Start background monitor (auto-pause idle containers)
-wk watch status           # Show monitor state + idle times
-wk watch stop             # Stop monitor
-```
-
-## How It Works
-
-```
-wk new feature/x
-  ├── git worktree add ../project-feature-x
-  ├── git submodule update --init
-  ├── Copy docker-compose.yml → .wk/docker-compose.yml
-  ├── Patch: name / hostname / SSH port / volume paths
-  ├── docker compose up -d
-  └── Checkout submodule to same branch (if exists on remote)
-```
-
-- **Port allocation**: `SSH_PORT = 10000 + hash(branch) % 9000` — deterministic, no registry needed
-- **Auto-wake**: `wk ssh` / `wk exec` / project commands automatically unpause or start stopped containers
-- **Idle monitoring**: `wk watch` periodically pauses containers idle beyond the configured timeout
-- **Safety**: `wk rm` checks for uncommitted changes before removing (use `-f` to override)
+Design documents: [architecture](docs/design/architecture.md) (structure) and
+[lxd-slot](docs/design/lxd-slot.md) (decisions, measurements, open questions).
 
 ## License
 
