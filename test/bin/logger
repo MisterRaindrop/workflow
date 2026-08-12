@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+# Stand-in for logger(1) so the audit trail can be asserted on.
+set -uo pipefail
+[[ -n "${WK_FAKE_CALLS:-}" ]] && printf 'logger %s\n' "$*" >> "$WK_FAKE_CALLS"
+exit 0

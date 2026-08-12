@@ -17,7 +17,12 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Syntax check
-        run: bash -n wk
+        run: |
+          bash -n wk
+          bash -n test.sh
+          bash -n install.sh
+          bash -n config.env.example
+          for f in test/fake-lxc test/bin/*; do bash -n "$f"; done
 
       - name: Install shellcheck
         run: |
@@ -27,8 +32,14 @@ jobs:
             sudo apt-get update && sudo apt-get install -y shellcheck
           fi
 
-      - name: Shellcheck
-        run: shellcheck -x wk test.sh install.sh || true
+      - name: Shellcheck (errors are fatal)
+        run: shellcheck -S error -x wk test.sh install.sh test/fake-lxc test/bin/*
 
-      - name: Run tests
+      - name: Shellcheck (warnings, advisory)
+        run: shellcheck -x wk test.sh install.sh test/fake-lxc test/bin/* || true
+
+      - name: Unit tests
         run: bash test.sh
+
+      - name: Help renders
+        run: ./wk help

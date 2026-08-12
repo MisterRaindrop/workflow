@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Stand-in for `iptables`, backed by a plain file so rule state persists across
+# calls within a test. This is what makes ensure_egress()'s idempotence
+# testable: -C must fail before -I and succeed after.
+#
+#   WK_FAKE_IPT_RULES   file holding the current DOCKER-USER rules
+#   WK_FAKE_IPT_NOCHAIN 1 = pretend the DOCKER-USER chain does not exist
+#   WK_FAKE_CALLS       file to append invocations to
+set -uo pipefail
+
+[[ -n "${WK_FAKE_CALLS:-}" ]] && printf 'iptables %s\n' "$*" >> "$WK_FAKE_CALLS"
+
+RULES=${WK_FAKE_IPT_RULES:-/dev/null}
+[[ "$RULES" != /dev/null && ! -f "$RULES" ]] && : > "$RULES"
+
+case "${1:-}" in
+-S)
+    [[ "${WK_FAKE_IPT_NOCHAIN:-0}" == 1 ]] && exit 1
+    printf -- '-N DOCKER-USER\n'
+    [[ -s "$RULES" ]] && cat "$RULES"
+    ;;
+-C)
+    shift
+    # Match on the comment tag plus the destination, order-independently —
+    # mirroring how wk itself has to match, since iptables prints -d before
+    # the comment.
+    tag=''; dest=''
+    while (( $# )); do
+        case "$1" in
+            --comment) tag=$2; shift 2 ;;
+            -d|-s)     dest=$2; shift 2 ;;
+            *)         shift ;;
+        esac
+    done
+    [[ -n "$tag" ]] || exit 1
+    grep -- "$tag" "$RULES" 2>/dev/null | grep -qF "${dest%%/*}" || exit 1
+    ;;
+-I|-A)
+    shift 2
+    [[ "${1:-}" =~ ^[0-9]+$ ]] && shift
+    printf -- '-A DOCKER-USER %s\n' "$*" >> "$RULES"
+    ;;
+-D)
+    shift 2
+    pattern=$*
+    if [[ -s "$RULES" ]]; then
+        grep -vF -- "$pattern" "$RULES" > "$RULES.tmp" 2>/dev/null || true
+        mv "$RULES.tmp" "$RULES"
+    fi
+    ;;
+*) : ;;
+esac
+
+exit 0

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Stand-in for host-side `docker`. wk only calls docker on the host in three
+# places (image inspect / pull / save inside warm_images); everything else runs
+# inside the guest and is intercepted at `lxc exec` instead.
+#
+#   WK_FAKE_DOCKER_IMAGES   space-separated images that "exist" on the host
+#   WK_FAKE_DOCKER_PULL_RC  exit code for `pull` (default 0)
+#   WK_FAKE_CALLS           file to append invocations to
+set -uo pipefail
+
+[[ -n "${WK_FAKE_CALLS:-}" ]] && printf 'docker %s\n' "$*" >> "$WK_FAKE_CALLS"
+
+has_image() {
+    local want=$1 img
+    for img in ${WK_FAKE_DOCKER_IMAGES:-}; do [[ "$img" == "$want" ]] && return 0; done
+    return 1
+}
+
+case "${1:-} ${2:-}" in
+"image inspect") has_image "${3:-}" || exit 1 ;;
+"image save")
+    # -o <path> <image>
+    [[ "${3:-}" == "-o" ]] && : > "${4:-/dev/null}"
+    ;;
+"image load") : ;;
+*)
+    case "${1:-}" in
+        pull) exit "${WK_FAKE_DOCKER_PULL_RC:-0}" ;;
+        *)    : ;;
+    esac
+    ;;
+esac
+
+exit 0

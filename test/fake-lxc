@@ -1,0 +1,152 @@
+#!/usr/bin/env bash
+# Stand-in for the `lxc` CLI, used by test.sh via WK_LXC=test/fake-lxc.
+#
+# Two jobs:
+#   1. answer queries from a fixture described in environment variables
+#   2. append every invocation to $WK_FAKE_CALLS so tests can assert on the
+#      calls wk actually made — which is where most of wk's behaviour lives
+#      (e.g. whether `bind` passed the right source=/path= to device add).
+#
+# Fixture variables (all optional):
+#   WK_FAKE_CONTAINERS   "lxslot1=RUNNING lxslot2=FROZEN lxslot3=STOPPED"
+#   WK_FAKE_BOUND        "lxslot1=/data/a lxslot3=/data/c"
+#   WK_FAKE_DEVNAME      device name to report for bound containers (default wk-source)
+#   WK_FAKE_META         "lxslot1.managed=1 lxslot1.note=hi"   (keys without user.wk.)
+#   WK_FAKE_EXEC_OUT     stdout to emit for `exec`
+#   WK_FAKE_EXEC_RC      exit code for `exec` (default 0)
+#   WK_FAKE_FAIL         space-separated subcommands that must fail, e.g. "start info"
+#   WK_FAKE_CALLS        file to append invocations to
+set -uo pipefail
+
+# --- record the call ----------------------------------------------------------
+if [[ -n "${WK_FAKE_CALLS:-}" ]]; then
+    printf '%s\n' "$*" >> "$WK_FAKE_CALLS"
+fi
+
+# --- fixture lookups ----------------------------------------------------------
+# Look up "key=value" pairs from a space-separated list.
+lookup() {
+    local list=${1:-} key=$2 pair
+    for pair in $list; do
+        [[ "${pair%%=*}" == "$key" ]] && { printf '%s' "${pair#*=}"; return 0; }
+    done
+    return 1
+}
+
+# Containers change state when started/stopped, otherwise ensure_running() could
+# never be tested: it starts a container and then verifies it reached RUNNING.
+# Overrides live next to the call log so each test run gets a fresh world.
+state_dir() { printf '%s/states' "$(dirname "${WK_FAKE_CALLS:-/tmp/wk-fake}")"; }
+
+set_state() {
+    mkdir -p "$(state_dir)" 2>/dev/null || return 0
+    printf '%s' "$2" > "$(state_dir)/$1"
+}
+
+container_state() {
+    local f="$(state_dir)/$1"
+    [[ -f "$f" ]] && { cat "$f"; return 0; }
+    lookup "${WK_FAKE_CONTAINERS:-}" "$1"
+}
+container_names() {
+    local pair
+    for pair in ${WK_FAKE_CONTAINERS:-}; do printf '%s\n' "${pair%%=*}"; done
+}
+bound_of()   { lookup "${WK_FAKE_BOUND:-}" "$1"; }
+meta_of()    { lookup "${WK_FAKE_META:-}" "$1.$2"; }
+
+should_fail() {
+    local sub=$1 f
+    for f in ${WK_FAKE_FAIL:-}; do [[ "$f" == "$sub" ]] && return 0; done
+    return 1
+}
+
+devname() { printf '%s' "${WK_FAKE_DEVNAME:-wk-source}"; }
+
+# Strip an lxc list pattern like '^lxslot1$' down to the bare name.
+unpattern() { local p=${1#^}; printf '%s' "${p%\$}"; }
+
+sub=${1:-}
+should_fail "$sub" && exit 1
+
+case "$sub" in
+list)
+    shift
+    pattern=''
+    [[ "${1:-}" != --* ]] && { pattern=$(unpattern "${1:-}"); shift || true; }
+    cols=n
+    while (( $# )); do
+        case "$1" in
+            -c) cols=${2:-n}; shift 2 ;;
+            --format) shift 2 ;;
+            *) shift ;;
+        esac
+    done
+    while read -r name; do
+        [[ -n "$name" ]] || continue
+        [[ -n "$pattern" && "$name" != "$pattern" ]] && continue
+        case "$cols" in
+            ns) printf '%s,%s\n' "$name" "$(container_state "$name")" ;;
+            *)  printf '%s\n' "$name" ;;
+        esac
+    done < <(container_names)
+    ;;
+
+config)
+    case "${2:-}" in
+    get)
+        name=${3:-}; key=${4:-}
+        case "$key" in
+            user.wk.*) meta_of "$name" "${key#user.wk.}" || true ;;
+            security.privileged|security.nesting|\
+            security.syscalls.intercept.mknod|security.syscalls.intercept.setxattr)
+                printf '%s' "${WK_FAKE_SECURITY:-true}" ;;
+            raw.lxc) printf 'lxc.apparmor.profile=unconfined' ;;
+            *) true ;;
+        esac
+        ;;
+    set) : ;;                      # recorded above; nothing to emit
+    device)
+        case "${3:-}" in
+        list)
+            name=${4:-}
+            bound_of "$name" >/dev/null 2>&1 && devname && printf '\n'
+            ;;
+        get)
+            name=${4:-}
+            [[ "${6:-}" == source ]] && { bound_of "$name" || true; }
+            ;;
+        add|remove) : ;;
+        esac
+        ;;
+    show) printf 'architecture: x86_64\n' ;;
+    esac
+    ;;
+
+exec)
+    printf '%s' "${WK_FAKE_EXEC_OUT:-}"
+    [[ -n "${WK_FAKE_EXEC_OUT:-}" ]] && printf '\n'
+    exit "${WK_FAKE_EXEC_RC:-0}"
+    ;;
+
+storage)
+    case "${2:-}" in
+        show)   [[ "${WK_FAKE_POOL_MISSING:-0}" == 1 ]] && exit 1
+                printf 'name: %s\ndriver: dir\n' "${3:-}" ;;
+        create) : ;;
+        *) : ;;
+    esac
+    ;;
+
+info)    printf 'server: fake\n' ;;
+version) printf 'Client version: 5.21.6 LTS\nServer version: 5.21.6 LTS\n' ;;
+start)   set_state "${2:-}" RUNNING ;;
+stop)    set_state "${2:-}" STOPPED ;;
+pause)   set_state "${2:-}" FROZEN ;;
+restart) set_state "${2:-}" RUNNING ;;
+init)    set_state "${3:-}" STOPPED ;;
+delete|file) : ;;
+*)       : ;;
+esac
+
+exit 0

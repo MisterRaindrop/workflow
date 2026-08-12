@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Stand-in for util-linux flock, which macOS does not ship. Lets the suite verify
+# that wk asks for the right lock mode and handles a failed acquisition.
+#   WK_FAKE_FLOCK_RC  exit code (default 0; non-zero simulates a held lock)
+set -uo pipefail
+[[ -n "${WK_FAKE_CALLS:-}" ]] && printf 'flock %s\n' "$*" >> "$WK_FAKE_CALLS"
+exit "${WK_FAKE_FLOCK_RC:-0}"

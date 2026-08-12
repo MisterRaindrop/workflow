@@ -1,0 +1,3 @@
+#!/usr/bin/env bash
+# Retry backoff would otherwise make the suite take minutes.
+exit 0

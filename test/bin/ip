@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Stand-in for iproute2's `ip`, which does not exist on macOS runners.
+# wk only uses `ip -4 route get <addr>` and parses the word after "dev".
+set -uo pipefail
+[[ -n "${WK_FAKE_CALLS:-}" ]] && printf 'ip %s\n' "$*" >> "$WK_FAKE_CALLS"
+[[ "${WK_FAKE_NO_ROUTE:-0}" == 1 ]] && exit 1
+printf '%s via 10.0.0.1 dev %s src 10.0.0.2\n' "${4:-1.2.3.4}" "${WK_FAKE_IFACE:-eth0}"
