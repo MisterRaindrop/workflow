@@ -3,7 +3,7 @@
 Manage long-lived LXD containers for isolated development and CI.
 
 Each container runs **its own Docker daemon**, so services with fixed names —
-`shared-ci-net`, `mysql`, `services-hive` — can exist in several containers
+`ci-net`, `db`, `cache` — can exist in several containers
 at once without colliding. Your code is a plain directory on the host that you
 clone yourself; `wk` only mounts it.
 
@@ -15,14 +15,14 @@ clone yourself; `wk` only mounts it.
 ## Why
 
 CI scripts hard-code service, network, and volume names. If every task shares the
-host's Docker daemon, two tasks fight over the same `shared-ci-net` network
-and the same `mysql` container. Renaming is not an option — the names live in the
+host's Docker daemon, two tasks fight over the same network
+and the same container names. Renaming is not an option — the names live in the
 CI scripts. So the isolation boundary has to sit at the Docker daemon itself:
 
 ```
-lxslot1 ──▶ docker ──▶ shared-ci-net / mysql / hive  ┐
-lxslot2 ──▶ docker ──▶ shared-ci-net / mysql / hive  ├ same names, invisible to each other
-lxslot3 ──▶ docker ──▶ shared-ci-net / mysql / hive  ┘
+lxslot1 ──▶ docker ──▶ ci-net / db / cache  ┐
+lxslot2 ──▶ docker ──▶ ci-net / db / cache  ├ same names, invisible to each other
+lxslot3 ──▶ docker ──▶ ci-net / db / cache  ┘
 ```
 
 ## Model
@@ -166,21 +166,20 @@ Every write operation is recorded to journald — `journalctl -t wk`.
 
 ## Per-project services
 
-Without any config, wk looks for the project layout (`services/mysql.yml` and the
-two `docker-compose-*-ci.yml` files). To be explicit, drop a `.wk.yaml` in your
-code directory:
+wk knows nothing about any particular project's layout. Declare what to bring up
+in a `.wk.yaml` next to your code:
 
 ```yaml
 services:
-  - services/mysql.yml
-  - scripts/functions/docker-compose/docker-compose-ci.yml
+  - compose/db.yml
+  - compose/ci.yml
 
 networks:
-  - shared-ci-net
+  - ci-net
 
 smoke_services:
-  - mysql
-  - services-hive
+  - db
+  - cache
 ```
 
 ## Capacity
@@ -205,8 +204,8 @@ full.
   rules on every path that needs the network, and `wk doctor` verifies the proxy is
   actually reachable from inside a container.
 
-Design documents: [architecture](docs/design/architecture.md) (structure) and
-[lxd-slot](docs/design/lxd-slot.md) (decisions, measurements, open questions).
+Design document: [architecture](docs/design/architecture.md) — structure and the
+reasoning behind it.
 
 ## License
 
