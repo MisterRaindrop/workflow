@@ -333,6 +333,25 @@ assert_called "…into the destination"               "^exec lxslot3 -- docker l
 assert_not_called "…without touching the host cache" "^docker image save"
 unset WK_WARM_IMAGES
 
+echo ""
+echo "=== WK_SEED_PATHS (extra dotfiles) ==="
+SEED_HOME="$TMP_ROOT/home"; mkdir -p "$SEED_HOME"
+printf 'set -g mouse on\n' > "$SEED_HOME/.tmux.conf"
+export WK_AUTH_HOME="$SEED_HOME"
+
+export WK_SEED_PATHS=".tmux.conf"
+wk_run auth lxslot1 >/dev/null 2>&1
+assert_called "seeds the extra dotfile"        "exec lxslot1 -- tar"
+out="$(wk_run auth lxslot1 2>&1)"
+assert_match "…and says what it is doing"      "seeding credentials and config" "$out"
+
+export WK_SEED_PATHS=".tmux.conf .nonexistent-file"
+out="$(wk_run auth lxslot1 2>&1)"
+assert_match "warns about a listed-but-missing path" "does not exist" "$out"
+assert_eq "…but still succeeds"                "0" "$(wk_rc auth lxslot1)"
+
+unset WK_SEED_PATHS WK_AUTH_HOME
+
 rm -rf "$TMP_ROOT"
 
 echo ""

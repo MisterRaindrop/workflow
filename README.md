@@ -132,6 +132,9 @@ wk doctor                      # LXD, storage pool, proxy egress, memory, per-co
 wk auth [c]                    # re-seed credentials after logging in again on the host
 ```
 
+`WK_SEED_PATHS` adds your own dotfiles (`.tmux.conf`, `.vimrc`, …) to what gets
+seeded, so a container feels like your own shell rather than a bare one.
+
 Credentials are **copied** into each container, not shared. After you log in again
 on the host (`codex`, `claude`, `gh`, …), run `wk auth`. A single writable
 `~/.codex` shared across containers would corrupt itself.

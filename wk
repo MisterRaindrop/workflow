@@ -30,6 +30,11 @@ WK_CACHE_MAX_GB=${WK_CACHE_MAX_GB:-50}
 # while returning 502. Space separated; empty disables the probe.
 WK_PROBE_URLS=${WK_PROBE_URLS:-}
 WK_NETWORKS=${WK_NETWORKS:-}
+# Extra paths to copy into every container, relative to the seed home. The
+# credential set below is always included; this is for everything else you want
+# to find inside — shell, editor and tmux config, for instance. Space separated.
+WK_SEED_PATHS=${WK_SEED_PATHS:-}
+
 WK_CODE_UID=${WK_CODE_UID:-1000}
 WK_CODE_GID=${WK_CODE_GID:-1000}
 WK_MEM_SAFETY=${WK_MEM_SAFETY:-80}   # percent of available memory we are willing to commit
@@ -876,9 +881,18 @@ seed_auth() {
     for p in .config/gh .config/glab-cli .ssh; do
         [[ -d "$home/$p" ]] && paths+=("$p")
     done
+    # Whatever the operator asked for on top of the credentials.
+    # shellcheck disable=SC2086
+    for p in $WK_SEED_PATHS; do
+        if [[ -e "$home/$p" ]]; then
+            paths+=("$p")
+        else
+            warn "WK_SEED_PATHS lists $p, but $home/$p does not exist"
+        fi
+    done
     (( ${#paths[@]} )) || { warn "nothing to seed from $home"; return 0; }
 
-    info "seeding credentials into $name (treat this container as trusted)"
+    info "seeding credentials and config into $name (treat this container as trusted)"
     tar -C "$home" -cpf - "${paths[@]}" | lxc_ exec "$name" -- tar -C /root -xpf -
     lxc_ exec "$name" -- bash -lc '
 set +e
