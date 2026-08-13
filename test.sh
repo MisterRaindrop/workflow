@@ -106,16 +106,16 @@ echo "=== parse_list_key ==="
 TMP_YAML="$(mktemp)"
 cat > "$TMP_YAML" <<'YAML'
 services:
-  - services/mysql.yml
-  - scripts/functions/docker-compose/docker-compose-ci.yml   # trailing comment
+  - compose/db.yml
+  - compose/ci.yml   # trailing comment
   - "quoted/path.yml"
 networks:
-  - shared-ci-net
+  - ci-net
 other_key: value
 YAML
 assert_eq "service count"   "3" "$(parse_list_key "$TMP_YAML" services | wc -l | tr -d ' ')"
-assert_eq "first service"   "services/mysql.yml" "$(parse_list_key "$TMP_YAML" services | head -1)"
-assert_eq "strips comment"  "scripts/functions/docker-compose/docker-compose-ci.yml" \
+assert_eq "first service"   "compose/db.yml" "$(parse_list_key "$TMP_YAML" services | head -1)"
+assert_eq "strips comment"  "compose/ci.yml" \
                             "$(parse_list_key "$TMP_YAML" services | sed -n 2p)"
 assert_eq "strips quotes"   "quoted/path.yml" "$(parse_list_key "$TMP_YAML" services | sed -n 3p)"
 assert_eq "stops at key"    "1" "$(parse_list_key "$TMP_YAML" networks | wc -l | tr -d ' ')"

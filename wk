@@ -17,8 +17,8 @@ if [[ -f "$WK_CONFIG" ]]; then
 fi
 
 WK_LXC=${WK_LXC:-lxc}
-WK_POOL=${WK_POOL:-data500}
-WK_DATA_ROOT=${WK_DATA_ROOT:-/mnt/data500/wk}
+WK_POOL=${WK_POOL:-wk}
+WK_DATA_ROOT=${WK_DATA_ROOT:-/var/lib/wk}
 WK_IMAGE=${WK_IMAGE:-ubuntu:24.04}
 WK_SLOTS=${WK_SLOTS:-"lxslot1 lxslot2 lxslot3"}
 WK_IMAGE_CACHE=${WK_IMAGE_CACHE:-$WK_DATA_ROOT/image-cache}
