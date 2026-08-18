@@ -262,6 +262,26 @@ assert_called "a normal command asserts egress rules" "iptables .*(-C|-I)"
 unset WK_PROXY WK_DIRECT_HOSTS WK_FAKE_IPT_RULES
 
 echo ""
+echo "=== ls --porcelain (machine-readable) ==="
+out="$(wk_run ls --porcelain)"
+assert_eq "one line per container"        "3" "$(grep -c . <<<"$out")"
+assert_eq "tab separated, six fields"     "6" "$(head -1 <<<"$out" | awk -F'\t' '{print NF}')"
+assert_eq "no header row"                 "lxslot1" "$(head -1 <<<"$out" | cut -f1)"
+assert_eq "state in field 2"              "RUNNING" "$(head -1 <<<"$out" | cut -f2)"
+# The whole point: paths must arrive whole, since the human table elides them.
+assert_eq "full path, never elided"       "/data/alpha" "$(head -1 <<<"$out" | cut -f5)"
+assert_eq "unbound reads as a dash"       "-" "$(sed -n 3p <<<"$out" | cut -f5)"
+assert_eq "note preserved"                "hello" "$(head -1 <<<"$out" | cut -f6)"
+
+# A long path must survive verbatim — this is the regression that broke bc.
+export WK_FAKE_BOUND="lxslot1=/mnt/data500/a-very-long-directory-name/nested/deeper/project"
+assert_eq "long paths are not truncated" \
+    "/mnt/data500/a-very-long-directory-name/nested/deeper/project" \
+    "$(wk_run ls --porcelain | head -1 | cut -f5)"
+assert_match "…while the human table does elide them" "\.\.\." "$(wk_run ls)"
+export WK_FAKE_BOUND="lxslot1=/data/alpha lxslot2=/data/beta"
+
+echo ""
 echo "=== concurrency lock ==="
 # macOS has no flock, so the suite injects one — this also covers the degrade path.
 wk_run bind lxslot3 "$BIND_DIR" --no-up >/dev/null

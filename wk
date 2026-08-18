@@ -558,8 +558,35 @@ GUEST
 
 # --- Commands: ls -------------------------------------------------------------
 cmd_ls() {
+    local porcelain=false
+    while (( $# )); do
+        case "$1" in
+            --porcelain) porcelain=true; shift ;;
+            *) shift ;;
+        esac
+    done
+
     local name state dir note idle mem last now
     now="$(date +%s)"
+
+    # Machine-readable form. The human table elides long paths to fit the
+    # terminal, which makes its CODE column unusable as a path — anything
+    # scripting against wk must read this instead.
+    # Tab-separated: name, state, last-active epoch (- if unknown), memory
+    # bytes (0 if unknown), bound directory (- if none), note.
+    if $porcelain; then
+        while read -r name; do
+            [[ -n "$name" ]] || continue
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+                "$name" \
+                "$(slot_state "$name")" \
+                "$(meta_get "$name" last-active || printf -- -)" \
+                "$( [[ "$(slot_state "$name")" == RUNNING ]] && slot_mem "$name" || meta_get "$name" mem-peak || printf 0 )" \
+                "$(bound_dir "$name" 2>/dev/null || printf -- -)" \
+                "$(meta_get "$name" note)"
+        done < <(managed_slots)
+        return 0
+    fi
 
     # Measure the widest name and path first: a fixed %-38s pushed NOTE off screen
     # as soon as a real bind path (55 chars here) showed up.
@@ -1645,7 +1672,8 @@ coexist across containers. Code is a plain host directory you clone yourself;
 wk only mounts it.
 
 Everyday:
-  wk ls                        list containers: state / idle / memory / code / note
+  wk ls [--porcelain]          list containers: state / idle / memory / code / note
+                               --porcelain: tab-separated raw values for scripts
   wk enter <c> [codex|claude]  go inside (thaws or starts it first)
 
 Code:
