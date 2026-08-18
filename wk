@@ -9,17 +9,31 @@ set -Eeuo pipefail
 WK_VERSION=2.0.0
 
 # --- Config -------------------------------------------------------------------
-# Load /etc/wk/config.env first, then let the environment win.
+# The config file holds host defaults; a WK_* already in the environment is a
+# deliberate override for this one command and must survive. Sourcing the file
+# assigns unconditionally, so snapshot what the caller set and restore it after
+# — otherwise `WK_WARM_IMAGES=... wk warm` silently does nothing because the
+# file sets that variable to empty.
 WK_CONFIG=${WK_CONFIG:-/etc/wk/config.env}
 if [[ -f "$WK_CONFIG" ]]; then
+    _wk_preset=''
+    _wk_names="$(compgen -v WK_ 2>/dev/null || true)"
+    # Guard the empty case: `declare -p` with no names dumps every variable.
+    [[ -n "$_wk_names" ]] && _wk_preset="$(declare -p $_wk_names 2>/dev/null || true)"
     # shellcheck disable=SC1090
     source "$WK_CONFIG"
+    [[ -n "$_wk_preset" ]] && eval "$_wk_preset"
+    unset _wk_preset _wk_names
 fi
 
 WK_LXC=${WK_LXC:-lxc}
 WK_POOL=${WK_POOL:-wk}
 WK_DATA_ROOT=${WK_DATA_ROOT:-/var/lib/wk}
 WK_IMAGE=${WK_IMAGE:-ubuntu:24.04}
+
+# The bridge containers attach to. Also the interface the egress rules match on,
+# so a host using a different bridge only has to say so here.
+WK_BRIDGE=${WK_BRIDGE:-lxdbr0}
 WK_SLOTS=${WK_SLOTS:-"lxslot1 lxslot2 lxslot3"}
 WK_IMAGE_CACHE=${WK_IMAGE_CACHE:-$WK_DATA_ROOT/image-cache}
 WK_WARM_IMAGES=${WK_WARM_IMAGES:-}
@@ -387,9 +401,9 @@ ensure_proxy_forwarding() {
     iptables_available || return 0
     iface="$(egress_iface "$host")" || return 0
 
-    local out=(-i lxdbr0 -o "$iface" -d "$host/32" -p tcp --dport "$port"
+    local out=(-i "$WK_BRIDGE" -o "$iface" -d "$host/32" -p tcp --dport "$port"
                -m comment --comment wk-proxy-out -j ACCEPT)
-    local back=(-i "$iface" -o lxdbr0 -s "$host/32" -p tcp --sport "$port"
+    local back=(-i "$iface" -o "$WK_BRIDGE" -s "$host/32" -p tcp --sport "$port"
                 -m conntrack --ctstate ESTABLISHED,RELATED
                 -m comment --comment wk-proxy-return -j ACCEPT)
 
@@ -409,9 +423,9 @@ ensure_direct_forwarding() {
         [[ "$dest" == */* ]] || dest="$dest/32"
         iface="$(egress_iface "$target")" || { warn "no route to direct host $target"; continue; }
 
-        local out=(-i lxdbr0 -o "$iface" -d "$dest"
+        local out=(-i "$WK_BRIDGE" -o "$iface" -d "$dest"
                    -m comment --comment wk-direct-out -j ACCEPT)
-        local back=(-i "$iface" -o lxdbr0 -s "$dest"
+        local back=(-i "$iface" -o "$WK_BRIDGE" -s "$dest"
                     -m conntrack --ctstate ESTABLISHED,RELATED
                     -m comment --comment wk-direct-return -j ACCEPT)
 
@@ -650,12 +664,48 @@ ensure_host() {
     need_cmd ip
     lxc_ info >/dev/null 2>&1 || die "LXD is not reachable (is it installed and initialised?)"
     mkdir -p "$WK_DATA_ROOT" "$WK_IMAGE_CACHE"
-    if ! lxc_ storage show "$WK_POOL" >/dev/null 2>&1; then
-        info "creating storage pool $WK_POOL at $WK_DATA_ROOT/lxd-storage"
-        mkdir -p "$WK_DATA_ROOT/lxd-storage"
-        lxc_ storage create "$WK_POOL" dir "source=$WK_DATA_ROOT/lxd-storage"
-    fi
+    ensure_lxd_usable
     ensure_egress
+}
+
+# `lxc init` needs the default profile to supply a root disk and a nic. A host
+# where `lxd init` was never run has neither, and the failure names neither.
+ensure_pool() {
+    lxc_ storage show "$WK_POOL" >/dev/null 2>&1 && return 0
+    info "creating storage pool $WK_POOL at $WK_DATA_ROOT/lxd-storage"
+    mkdir -p "$WK_DATA_ROOT/lxd-storage"
+    lxc_ storage create "$WK_POOL" dir "source=$WK_DATA_ROOT/lxd-storage" \
+        || die "could not create storage pool $WK_POOL"
+    # Confirm it is actually visible: the next thing to run references this pool
+    # by name, and a create that has not settled fails there instead of here.
+    lxc_ storage show "$WK_POOL" >/dev/null 2>&1 \
+        || die "storage pool $WK_POOL was created but is not visible yet — re-run"
+}
+
+ensure_lxd_usable() {
+    # Order matters: the profile's root disk names the pool, so the pool has to
+    # exist first or the profile ends up pointing at nothing and only fails when
+    # an instance is created.
+    ensure_pool
+
+    if ! lxc_ network list --format csv 2>/dev/null | grep -q "^$WK_BRIDGE,"; then
+        info "creating network bridge $WK_BRIDGE"
+        lxc_ network create "$WK_BRIDGE" >/dev/null \
+            || die "could not create bridge $WK_BRIDGE"
+    fi
+
+    local devices
+    devices="$(lxc_ profile show default 2>/dev/null || true)"
+    if ! grep -qE '^\s+root:' <<<"$devices"; then
+        info "adding a root disk to the default profile (pool $WK_POOL)"
+        lxc_ profile device add default root disk pool="$WK_POOL" path=/ >/dev/null \
+            || die "could not add a root disk to the default profile"
+    fi
+    if ! grep -qE '^\s+eth0:' <<<"$devices"; then
+        info "attaching the default profile to $WK_BRIDGE"
+        lxc_ profile device add default eth0 nic network="$WK_BRIDGE" name=eth0 >/dev/null \
+            || die "could not attach the default profile to $WK_BRIDGE"
+    fi
 }
 
 apply_slot_config() {
@@ -727,6 +777,17 @@ if [[ -n "$proxy" ]]; then
     install -d /etc/apt/apt.conf.d
     printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "$proxy" "$proxy" \
         > /etc/apt/apt.conf.d/95-wk-proxy
+
+    # Switch the archives to https. A CONNECT-only proxy tunnels https fine but
+    # answers plain http to the Ubuntu archives with 400 Bad Request, so apt
+    # cannot even read InRelease. Measured on two hosts against the same proxy:
+    # http -> 400, https -> 200.
+    for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
+        [[ -f "$f" ]] || continue
+        # Address-then-substitute keeps this portable BRE, and confines the
+        # rewrite to Ubuntu's own archives.
+        sed -i '/ubuntu\.com/ s|http://|https://|g' "$f"
+    done
 fi
 
 retry apt-get update
@@ -804,8 +865,11 @@ retry() {
 # drags in gcc, python and even X11 packages — measured at 566 packages / 172 MB
 # on a real build. The agent CLIs are pure JS and need none of it.
 retry apt-get update
+# make earns its place: a project's build entry point is almost always a
+# Makefile, and it runs at this layer — it is the thing that spawns the build
+# container. Without it the build fails with a bare rc=127.
 retry apt-get install -y --no-install-recommends \
-    git openssh-client ca-certificates curl jq tmux nodejs npm
+    git openssh-client ca-certificates curl jq tmux make nodejs npm
 apt-cache show gh   >/dev/null 2>&1 && apt-get install -y --no-install-recommends gh   || true
 apt-cache show glab >/dev/null 2>&1 && apt-get install -y --no-install-recommends glab || true
 GUEST
@@ -1506,6 +1570,24 @@ cmd_doctor() {
         ok "storage pool $WK_POOL exists (${driver:-unknown} driver)"
     else
         bad "storage pool $WK_POOL missing — wk new will create it"
+    fi
+
+    if lxc_ network list --format csv 2>/dev/null | grep -q "^$WK_BRIDGE,"; then
+        ok "network bridge $WK_BRIDGE exists"
+    elif $fix; then
+        ensure_lxd_usable && ok "network bridge $WK_BRIDGE created"
+    else
+        bad "network bridge $WK_BRIDGE missing — containers would have no network (fix: wk doctor --fix)"
+    fi
+
+    local prof
+    prof="$(lxc_ profile show default 2>/dev/null || true)"
+    if grep -qE '^\s+root:' <<<"$prof" && grep -qE '^\s+eth0:' <<<"$prof"; then
+        ok "default profile provides a root disk and a nic"
+    elif $fix; then
+        ensure_lxd_usable && ok "default profile wired up"
+    else
+        bad "default profile has no root disk / nic — lxc init would fail (fix: wk doctor --fix)"
     fi
 
     local avail swap_total swap_free

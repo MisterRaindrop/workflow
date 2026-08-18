@@ -262,6 +262,25 @@ assert_called "a normal command asserts egress rules" "iptables .*(-C|-I)"
 unset WK_PROXY WK_DIRECT_HOSTS WK_FAKE_IPT_RULES
 
 echo ""
+echo "=== config vs environment precedence ==="
+# The config file is the host default; a WK_* already in the environment is a
+# deliberate override for one command. Sourcing the file used to clobber it, so
+# `WK_WARM_IMAGES=... wk warm` silently warmed nothing.
+CFG="$TMP_ROOT/precedence.env"
+printf 'WK_WARM_IMAGES=""\nWK_POOL=from-config\nWK_MEM_SAFETY=55\n' > "$CFG"
+probe() {
+    ( unset WK_SOURCE_ONLY
+      export WK_CONFIG="$CFG"
+      [[ -n "${2:-}" ]] && export "$2"
+      WK_SOURCE_ONLY=1 bash -c "source '$WK'; printf '%s' \"\${$1}\"" )
+}
+assert_eq "environment beats the config file"   "env-wins" "$(probe WK_WARM_IMAGES 'WK_WARM_IMAGES=env-wins')"
+assert_eq "config still supplies a default"     "from-config" "$(probe WK_POOL)"
+assert_eq "…and is overridable too"             "other" "$(probe WK_POOL 'WK_POOL=other')"
+assert_eq "numeric settings behave the same"    "55" "$(probe WK_MEM_SAFETY)"
+assert_eq "an empty config value is a default"  "" "$(probe WK_WARM_IMAGES)"
+
+echo ""
 echo "=== ls --porcelain (machine-readable) ==="
 out="$(wk_run ls --porcelain)"
 assert_eq "one line per container"        "3" "$(grep -c . <<<"$out")"
