@@ -160,6 +160,14 @@ chmod +x "$FAKE_DIR/fake-lxc" "$FAKE_DIR/bin/"* 2>/dev/null || true
 TMP_ROOT="$(mktemp -d)"
 CALLS="$TMP_ROOT/calls"
 
+# `source "$WK"` above ran wk's own variable defaults in this shell, so
+# WK_DATA_ROOT is already /var/lib/wk here. Any `${WK_DATA_ROOT:-sandbox}`
+# fallback would therefore resolve to the production path, and a test would try
+# to mkdir it. Set them outright instead; wk_run only exports what it finds, so
+# a test that wants a different value (see the cache tests) just assigns it.
+WK_DATA_ROOT="$TMP_ROOT/data"
+WK_IMAGE_CACHE="$TMP_ROOT/data/image-cache"
+
 # Run wk in a clean subprocess. WK_SOURCE_ONLY must not leak in, or main() never runs.
 wk_run() {
     : > "$CALLS"
@@ -171,6 +179,9 @@ wk_run() {
         export WK_CONFIG=/nonexistent/wk-test-config.env
         export WK_FAKE_CALLS="$CALLS"
         export WK_RUN_DIR="$TMP_ROOT/run"
+        # Whatever the suite currently has these set to — sandbox paths by
+        # default, or a case-specific directory. Never wk's real defaults.
+        export WK_DATA_ROOT WK_IMAGE_CACHE
         export WK_TMUX=0
         # </dev/null: the fake lxc drains piped stdin (like the real client), so
         # wk must never inherit the harness's stdin — a held-open one hangs it.
@@ -370,6 +381,25 @@ assert_eq "declared groups are listable"    "ci" \
           "$(WK_SOURCE_ONLY=1 bash -c "source '$WK'; service_groups '$GDIR'")"
 assert_eq "an unknown group finds nothing"  "0" \
           "$(WK_SOURCE_ONLY=1 bash -c "source '$WK'; service_files '$GDIR' nope" | wc -l | tr -d ' ')"
+
+echo ""
+echo "=== new --from: clone instead of provision ==="
+# Cloning replaces ~26 minutes of apt and image loading with a copy. What must
+# not be inherited is the source's identity or its bound checkout.
+CLONE_HOME="$TMP_ROOT/clonehome"; mkdir -p "$CLONE_HOME/.codex"
+printf '{}' > "$CLONE_HOME/.codex/auth.json"
+export WK_AUTH_HOME="$CLONE_HOME"
+wk_run new lxslot9 --from lxslot1 >/dev/null 2>&1
+assert_called "clones with --stateless"          "^copy lxslot1 lxslot9 --stateless"
+assert_called "drops the inherited code mount"   "config device remove lxslot9 wk-source"
+assert_called "clears the copied machine-id"     "file push - lxslot9/etc/machine-id"
+assert_called "re-seeds credentials"             "exec lxslot9 -- tar"
+assert_not_called "…and never runs apt"          "exec lxslot9 -- bash -s"
+unset WK_AUTH_HOME
+out="$(wk_run new lxslot1 --from lxslot2 2>&1)"
+assert_match "refuses to overwrite an existing"  "already exists" "$out"
+out="$(wk_run new lxslot9 --from nosuch 2>&1)"
+assert_match "…and an unknown source"            "no such container" "$out"
 
 echo ""
 echo "=== the group reaches the guest that starts the services ==="

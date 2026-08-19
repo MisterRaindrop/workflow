@@ -50,8 +50,17 @@ container_state() {
     lookup "${WK_FAKE_CONTAINERS:-}" "$1"
 }
 container_names() {
-    local pair
+    local pair f
     for pair in ${WK_FAKE_CONTAINERS:-}; do printf '%s\n' "${pair%%=*}"; done
+    # Containers created during the run count as existing. Without this a test
+    # cannot follow `wk new` past the point where it waits for the container it
+    # just created to reach RUNNING — the fixture would never list it.
+    if [[ -d "$(state_dir)" ]]; then
+        for f in "$(state_dir)"/*; do
+            [[ -e "$f" ]] || continue
+            printf '%s\n' "$(basename "$f")"
+        done
+    fi
 }
 bound_of()   { lookup "${WK_FAKE_BOUND:-}" "$1"; }
 meta_of()    { lookup "${WK_FAKE_META:-}" "$1.$2"; }
@@ -157,6 +166,7 @@ stop)    set_state "${2:-}" STOPPED ;;
 pause)   set_state "${2:-}" FROZEN ;;
 restart) set_state "${2:-}" RUNNING ;;
 init)    set_state "${3:-}" STOPPED ;;
+copy)    set_state "${3:-}" STOPPED ;;   # a clone exists, stopped, like the real one
 delete|file) : ;;
 *)       : ;;
 esac

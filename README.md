@@ -211,6 +211,55 @@ wk up -g ci <c>            # just the CI stack
 
 Without `-g`, behaviour is exactly as before.
 
+## Cloning a ready container
+
+Building a container from scratch costs about 26 minutes — 20 of apt, 6 of
+loading the build image — and every container keeps its own copy of that image.
+On this project's build image that is 27GB each. Cloning replaces all of it:
+
+```bash
+wk new lxslot9 --from lxslot3      # 49 seconds, no extra disk
+```
+
+Measured on a btrfs pool: `lxc copy` returned in under a second, the pool grew
+by nothing at all, and a full build on the clone took 22m55s against 23m08s on
+a plain dir pool — so the sharing costs nothing at runtime either. Three
+containers each holding the same 27GB image occupied 27.69GiB in total.
+
+The clone drops what must not be inherited: the source's bound checkout, and
+`/etc/machine-id` (which `lxc copy` duplicates verbatim, leaving two machines
+with one identity). Credentials are re-seeded from the host, since they may have
+been refreshed since the source was built.
+
+**This is not a shared Docker daemon directory.** Two daemons pointed at one
+`/var/lib/docker` corrupt each other's metadata. Here each container keeps its
+own writable view and only the underlying blocks are shared: deleting an image
+inside one clone leaves the other's copy intact and runnable — verified.
+
+### It needs a copy-on-write pool
+
+CoW is a property of the storage pool, not of wk. On a `dir` pool the clone
+still works but duplicates every byte, and `wk doctor` says so. To get one
+without touching an existing pool, back it with a file:
+
+```bash
+truncate -s 200G /data/wk/cow.img
+mkfs.btrfs -q /data/wk/cow.img
+mkdir -p /data/wk/cow
+echo "/data/wk/cow.img /data/wk/cow btrfs loop,noatime 0 0" >> /etc/fstab
+mount /data/wk/cow
+lxc storage create wk-cow btrfs source=/data/wk/cow
+
+# then, with WK_POOL=wk-cow in your config:
+wk new golden                      # build one properly, once
+wk new task1 --from golden         # and clone it from then on
+```
+
+The fstab line matters: without it the pool disappears on reboot.
+
+Keep the golden container free of a bound checkout, and rebuild it when the
+image it carries changes.
+
 ## Capacity
 
 `wk ls` samples each container's real memory footprint and records the high-water

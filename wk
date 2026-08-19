@@ -878,12 +878,27 @@ if [[ -n "$proxy" ]]; then
     # answers plain http to the Ubuntu archives with 400 Bad Request, so apt
     # cannot even read InRelease. Measured on two hosts against the same proxy:
     # http -> 400, https -> 200.
+    changed=0
     for f in /etc/apt/sources.list.d/ubuntu.sources /etc/apt/sources.list; do
         [[ -f "$f" ]] || continue
         # Address-then-substitute keeps this portable BRE, and confines the
         # rewrite to Ubuntu's own archives.
+        grep -q 'http://.*ubuntu\.com' "$f" && changed=1
         sed -i '/ubuntu\.com/ s|http://|https://|g' "$f"
     done
+
+    # Rewriting the sources is not enough on its own. apt names its index cache
+    # by host and path with no scheme in it, so after the rewrite it reuses an
+    # index that was fetched over http — and derives http URLs for the .debs
+    # from it, which this proxy answers with 400. Measured on a real build:
+    # `apt update` reported https throughout while `apt install` failed on
+    # http URLs for every package, five retries in a row. Whether it happens
+    # depends on whether InRelease changed enough to force a full refetch, so
+    # it reads as an intermittent network fault and is not one.
+    # Dropping the cache costs one index download and removes the ambiguity.
+    if (( changed )); then
+        rm -rf /var/lib/apt/lists/*
+    fi
 fi
 
 retry apt-get update
@@ -1214,8 +1229,78 @@ warm_images() {
     done
 }
 
+# Cloning a provisioned container instead of building one is the difference
+# between 26 minutes and 13 seconds. Measured on a btrfs pool: `lxc copy` took
+# under a second and added no space at all, because copy-on-write shares the
+# blocks — including a 27GB build image — while each container keeps its own
+# writable view. A full build on the clone took 22m55s against 23m08s on a
+# plain dir pool, so the sharing costs nothing at runtime either.
+#
+# This is not sharing /var/lib/docker between daemons, which corrupts metadata.
+# Verified: deleting an image inside one clone leaves the other's copy intact
+# and runnable, and each clone sees only the images it added itself.
+#
+# CoW is a property of the storage pool. On a dir pool the copy still works but
+# is a full byte-for-byte copy, so say so rather than let it look broken.
+clone_slot() {
+    local src=$1 name=$2 driver
+
+    require_slot "$src"
+    driver="$(lxc_ storage show "$WK_POOL" 2>/dev/null | awk '/^driver:/ { print $2 }')"
+    case "$driver" in
+        btrfs|zfs|lvm|ceph) info "cloning $src into $name (copy-on-write on $driver)" ;;
+        *) warn "pool $WK_POOL uses the '$driver' driver, which has no copy-on-write"
+           hint "the copy will duplicate every byte; a btrfs or zfs pool makes this instant"
+           info "cloning $src into $name" ;;
+    esac
+
+    # --stateless: the source keeps running. Without it lxc wants to migrate
+    # live process state and needs CRIU, which is not what a clone is for.
+    lxc_ copy "$src" "$name" --stateless \
+        || die "could not clone $src into $name"
+
+    # Two things must not come along.
+    #
+    # The source's code mount: a new slot binds its own tree, and inheriting a
+    # path silently makes two containers write to one checkout.
+    local dev
+    for dev in "${WK_SOURCE_DEVICES[@]}"; do
+        lxc_ config device remove "$name" "$dev" >/dev/null 2>&1 || true
+    done
+
+    # /etc/machine-id, which lxc copies verbatim — leaving two machines with
+    # one identity, which journald and anything keyed on it will believe.
+    # Emptying the file (rather than deleting it) is what systemd looks for to
+    # generate a fresh one on the next boot; the container is still stopped
+    # here, so this happens before its first start.
+    printf '' | lxc_ file push - "$name/etc/machine-id" 2>/dev/null || true
+
+    apply_slot_config "$name"
+    ensure_running "$name"
+
+    # A clone starts its Docker daemon from scratch, and RUNNING is reached
+    # well before dockerd is listening — measured, about 20 seconds. The
+    # from-scratch path never had to wait because install_docker ends by
+    # calling `docker info`; without the same wait here, verify runs too early
+    # and reports a working container as unusable.
+    step "waiting for the Docker daemon"
+    wait_docker "$name" || warn "Docker did not come up in $name — check: wk exec $name 'journalctl -u docker -n 50'"
+
+    # The host's credentials may have been refreshed since the source was built.
+    seed_auth "$name" || warn "could not re-seed credentials into $name"
+    touch_active "$name"
+    audit "new $name --from $src"
+}
+
 cmd_new() {
-    local name=${1:-}
+    local name='' from=''
+    while (( $# )); do
+        case "$1" in
+            --from|-f) from=${2:-}; shift 2 ;;
+            -*)        die "unknown flag: $1" ;;
+            *)         name=$1; shift ;;
+        esac
+    done
     ensure_host
 
     if [[ -z "$name" ]]; then
@@ -1228,24 +1313,31 @@ cmd_new() {
 
     capacity_check
 
-    if slot_exists "$name"; then
-        info "$name exists — re-running setup (idempotent)"
+    if [[ -n "$from" ]]; then
+        slot_exists "$name" && die "$name already exists — pick another name, or: wk rm $name"
+        clone_slot "$from" "$name"
     else
-        info "creating $name from $WK_IMAGE on pool $WK_POOL"
-        lxc_ init "$WK_IMAGE" "$name" --storage "$WK_POOL"
-    fi
+        if slot_exists "$name"; then
+            info "$name exists — re-running setup (idempotent)"
+        else
+            info "creating $name from $WK_IMAGE on pool $WK_POOL"
+            lxc_ init "$WK_IMAGE" "$name" --storage "$WK_POOL"
+        fi
 
-    apply_slot_config "$name"
-    ensure_running "$name"
+        apply_slot_config "$name"
+        ensure_running "$name"
 
-    if ! lxc_ exec "$name" -- docker info >/dev/null 2>&1; then
-        install_docker "$name" || die "installing Docker in $name failed — see the guest error above; wk new is idempotent, re-run it to continue"
-    else
-        step "Docker already present"
+        if ! lxc_ exec "$name" -- docker info >/dev/null 2>&1; then
+            install_docker "$name" \
+                || die "installing Docker in $name failed — see the guest error above; wk new is idempotent, re-run it to continue"
+        else
+            step "Docker already present"
+        fi
+        install_tools "$name" \
+            || die "installing tools in $name failed — see the guest error above; wk new is idempotent, re-run it to continue"
+        seed_auth "$name"   || die "seeding credentials into $name failed"
+        warm_images "$name" || die "warming images into $name failed"
     fi
-    install_tools "$name" || die "installing tools in $name failed — see the guest error above; wk new is idempotent, re-run it to continue"
-    seed_auth "$name"    || die "seeding credentials into $name failed"
-    warm_images "$name"  || die "warming images into $name failed"
     # `wk smoke` needs this to prove in-network DNS and uid-1000 write access.
     # A few MB, and fetching it now beats a smoke test that cannot run later.
     lxc_ exec "$name" -- bash -lc "docker image inspect $WK_PROBE_IMAGE >/dev/null 2>&1 \
@@ -1879,6 +1971,14 @@ cmd_doctor() {
         local driver
         driver="$(lxc_ storage show "$WK_POOL" 2>/dev/null | awk '/^driver:/ { print $2; exit }')"
         ok "storage pool $WK_POOL exists (${driver:-unknown} driver)"
+        # Whether `wk new --from` is instant or copies 27GB is decided here, and
+        # it is not otherwise visible. Measured on this host: 49 seconds and no
+        # extra disk on btrfs, against ~26 minutes and 27GB from scratch.
+        case "${driver:-}" in
+            btrfs|zfs|lvm|ceph) ok "…which supports copy-on-write (wk new --from is instant)" ;;
+            *) hint "no copy-on-write on '$driver': wk new --from would duplicate every byte"
+               hint "a btrfs/zfs pool makes cloning instant and free — see README" ;;
+        esac
     else
         bad "storage pool $WK_POOL missing — wk new will create it"
     fi
@@ -2082,6 +2182,8 @@ Power:
 
 Setup (rare):
   wk new [name]                build a container: Docker, tools, credentials, images
+  wk new [name] --from <src>   clone a ready container instead — seconds, and on a
+                               btrfs/zfs pool costs no extra disk
   wk rm [-f] <c>               delete a container (never touches your code)
   wk doctor [--fix]            check LXD, proxy egress, memory, container config
   wk auth [c]                  re-seed credentials after logging in again on the host
