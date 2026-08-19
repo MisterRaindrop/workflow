@@ -144,8 +144,8 @@ on the host (`codex`, `claude`, `gh`, …), run `wk auth`. A single writable
 ```bash
 wk exec [--retry N] <c> <cmd>  # run a command in the container
 wk dexec <c> <docker> <cmd>    # run a command in one of its Docker containers
-wk up|down <c>                 # start/stop project services only
-wk smoke <c>                   # services, in-network DNS, docker exec/cp, write access
+wk up|down [-g <grp>] <c>      # start/stop project services (one group at a time)
+wk smoke [-g <grp>] <c>        # services, in-network DNS, docker exec/cp, write access
 wk warm <c> [--from <src>]     # load cached images, or stream them from another container
 wk cache ls|prune              # list / LRU-trim the host image cache
 wk note <c> [text]             # get/set the note shown in wk ls
@@ -181,6 +181,35 @@ smoke_services:
   - db
   - cache
 ```
+
+### Groups
+
+A checkout often has several stacks that are not interchangeable — one for
+integration tests, one for CI — with separately provisioned images. Since
+`wk up` starts every declared compose file with `--pull never`, a single image
+that is absent on this host fails the whole batch and takes the other stack down
+with it.
+
+A group is just a suffixed key, read by the same parser:
+
+```yaml
+services:                  # the default group
+  - compose/datalake.yml
+
+services_ci:               # wk up -g ci
+  - compose/mysql.yml
+  - compose/hive.yml
+
+smoke_services_ci:
+  - mysql
+```
+
+```bash
+wk up <c>                  # default group
+wk up -g ci <c>            # just the CI stack
+```
+
+Without `-g`, behaviour is exactly as before.
 
 ## Capacity
 

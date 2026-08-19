@@ -191,6 +191,150 @@ lxc exec <src> -- docker save <image> | lxc exec <dst> -- docker load
 
 ---
 
+## 9. systemd 单元里 guest 输出全部丢失 —— 已修，记录在此
+
+**现象**：`systemd-run --unit=x wk new lxslot2` 失败，journal 里只有 wk 自己的
+`=> installing Docker in lxslot2` 和 systemd 的 exit-code，**guest 里 5 分钟的
+apt 重试与最终报错一行都没有**。诊断时完全无从下手。
+
+**根因**（实测最小复现）：journald 给单元的 stdout/stderr 是 **socket**，
+而 LXD client 不把 `lxc exec` 的 guest 输出转发进 socket —— 只有退出码传出来：
+
+```bash
+systemd-run --wait lxc exec c1 -- bash -c "echo OUT; echo ERR >&2; exit 3"
+# journal: 只有 systemd 的 status=3，OUT / ERR 都不见
+systemd-run --wait bash -c 'lxc exec c1 -- bash -c "..." 2> >(cat >&2) | cat'
+# journal: OUT / ERR 都在 —— lxc 的 stdio 是管道时转发正常
+```
+
+**修法**：wk 启动时检测自己的 stdout/stderr 是不是 socket，是就
+`exec 1> >(cat)` / `exec 2> >(cat >&2)` 自我重管道 —— 子进程看到的是管道，
+cat 落到 socket 的普通写不受影响。一处修复覆盖所有 `lxc exec` 调用。
+
+配套两点：guest heredoc 里加 `trap ... ERR` 报出具体死在哪条命令；
+`cmd_new` 的各安装阶段加 `|| die`，并提示 `wk new` 幂等、重跑即续。
+否则 `set -e` 下失败是静默的 —— 这次排障的成本就花在「双重静默」上。
+
+---
+
+## 10. 一个可选工具装不上，整个容器被判废 —— 已修，记录在此
+
+**现象**：`wk new lxslot2` 失败退出。但容器里 Docker、git、make、tmux、codex、
+凭据、代理**全部正常** —— 唯一没成的是 `npm install -g @anthropic-ai/claude-code`。
+一个编译环境完全可用，却因为一个 agent CLI 被扔掉。
+
+**两层根因，缺一不可**：
+
+1. **分层缺失**。`install_tools` 把编译必需的（git/make/curl/jq/tmux）和便利性的
+   （nodejs/npm → codex/claude）放在同一条 apt 里，一起 `retry`，一起失败。
+   实测：代理大面积丢 TLS 握手时，git/make/tmux 全装上了，只有 nodejs 的 20 多个
+   依赖 .deb 失败 —— 但整条命令返回非零。
+
+2. **`set -e` 把可选变成致命**。`npm install -g` 一失败，guest 脚本立刻退出，
+   `install_tools` 非零，`cmd_new` 的 `|| die` 触发。
+
+**还有第三个真因，npm 自己不说**：
+```
+npm WARN EBADENGINE package: '@anthropic-ai/claude-code@2.1.235',
+                    required: { node: '>=22.0.0' }, current: { node: 'v18.19.1' }
+```
+Ubuntu 24.04 的 apt 只有 node 18，而 claude-code 要 22。npm 的日志通篇在说
+`network`/`ECONNRESET`，于是人去修代理 —— 修完还是装不上。
+
+**修法**：
+- apt 分两层：必需的失败才致命，nodejs/npm 失败只报告。
+- `npm install` 加重试且永不致命；claude-code 先查 node 大版本，不够就直说
+  「node 18 装不了，需要 22；在 host 上装好，wk 会把 host 的包拷进去」。
+- host 包探测覆盖 `npm root -g` / `/usr/lib` / `/usr/local/lib` —— 只看一处，
+  等于 host 明明有却仍然去 npm。
+- `verify` 分两级严重度，退出码区分：**2 = 不能编译**（docker/git/make/代理），
+  **1 = 能编译但 agent 工具不全**，0 = 全绿。并且 host 自己都没有的 CLI
+  不计为容器的问题 —— 那是 host 侧的事实，报错要指向对的地方。
+
+顺带补上一个一直没查的项：`verify` 从来没检查 `make`，而它正是编译的入口。
+
+---
+
+## 11. 一份扁平的服务清单挡住了另一套服务 —— 已修
+
+**问题**：`.wk.yaml` 只有一个 `services:` 列表，`wk up` 全起。而一个 checkout 里
+可能有**多套互不相干**的服务栈，各自从不同的 registry 供给镜像。实测遇到的一例：
+
+| 栈 | 容器 | 镜像来源 |
+|---|---|---|
+| 集成测试 | polaris / minio / hadoop / hive-metastore / hiveserver2 / spark-master / spark-worker / postgres | registry A（本机已全部具备） |
+| CI fixture | mysql / hive / mysql-s3 / hive-s3 一组 | registry B（**本机一个都没有**） |
+
+`services_up` 用 `--pull never`（镜像由 `wk warm` 供给，缺了就该立刻失败而不是偷偷
+联网）。于是一份扁平清单的后果是：CI 那五个镜像不在本机 → 整批 compose 失败 →
+**datalake 那套也起不来**。
+
+**修法：分组就是一个后缀键**。`services_ci:` 与 `services:` 并列，
+现有的列表解析器原样能读，不引入新语法；不带 `--group` 时行为与以前完全一致。
+
+```bash
+wk up lxslot2            # 默认组：datalake
+wk up -g ci lxslot2      # CI 那套
+wk smoke -g ci lxslot2
+```
+
+两套的容器名与端口实测不冲突（CI 只暴露 3306，datalake 用 5432/9000/8181/9083/…），
+所以同一个 slot 里共存没问题 —— 分组是为了**按需启动**和**互不牵连**，不是为了避冲突。
+
+---
+
+## 12. 注入的代理拦掉了容器间通信 —— 已修，这是本轮最严重的一个
+
+**现象**：datalake 那套 10 个容器全部起来了，`docker ps` 一片 Up，`minio-init`
+还是 `Exited (0)`。但 minio 的两个桶（`warehouse` / `data`）**一个都没建成**，
+`/data` 里只有 `.minio.sys`。
+
+**因果链**（每一步都实测过）：
+
+1. `install_docker` 写 `/root/.docker/config.json`，其中
+   `proxies.default.noProxy` 只有 `localhost,127.0.0.1,::1`。
+   这是刻意的：编译容器要下公网依赖，而项目的 Makefile 不传代理，只能靠
+   Docker CLI 注入。
+2. Docker CLI 把代理注入**它创建的每一个容器** —— 包括 compose 起的服务。实测
+   `docker exec minio env` 里就有 `HTTP_PROXY=...`，`NO_PROXY` 只有那三项。
+3. `minio-init` 执行 `mc alias set local http://minio:9000 ...`。mc 是 Go 写的，
+   尊重 `HTTP_PROXY`；主机名 `minio` 不在 noProxy 里，于是请求发给代理。
+4. 代理从没听说过 `minio` 这台主机 → **502 Bad Gateway**。
+5. mc 把 502 当成「凭据/别名不对」，**回落到默认的 localhost:9000**：
+   `Put "http://localhost:9000/warehouse/": dial tcp [::1]:9000: connect: connection refused`
+6. entrypoint 末尾有一句 `exit 0`，于是容器**以 0 退出**。整个栈的状态里
+   没有任何一处显示出错。
+
+一个「全绿」的环境，S3 上什么都没有。后面 polaris 建 catalog 必然失败，而报错会
+指向 polaris 或 iceberg，离真因隔着五层。
+
+**修法**：起服务之前，把这一组的服务名加进 noProxy。服务名恰好就是网络内使用的
+主机名，而 compose 自己能列出来：
+
+```bash
+docker compose -f <每个文件> config --services   # → hadoop,hive-metastore,minio,polaris,…
+jq '.proxies.default.noProxy = $np' /root/.docker/config.json
+```
+
+只有这些名字绕过代理，其余照旧走代理 —— 编译容器下载公网依赖不受影响。
+
+实测修复后：`Bucket created successfully local/data`，`/data` 下 `data` 与
+`warehouse` 都在。
+
+**留给项目侧的两点**（工具层不该替它改）：
+
+- `minio-init` 的 entrypoint 以 `exit 0` 收尾，任何失败都被吞掉。去掉它，
+  或者显式检查每一步。
+- `hiveserver2` 的 healthcheck 写成
+  `test: ["CMD", "bash -c '...' || exit 1"]`。`CMD` 形式下数组每项是一个 argv，
+  于是 docker 去 exec 一个名字叫 `bash -c '...' || exit 1` 的文件，
+  报 `OCI runtime exec failed`，ExitCode 恒为 `-1`，探针**从未成功过一次** ——
+  而端口 10000 一直是开的。应为 `CMD-SHELL`。
+  wk 现在把这种情况单独归为 `broken-probe`，明确说是 compose 的定义问题，
+  不再报成服务故障（否则读的人会去查 hive，而真因在 yaml 里）。
+
+---
+
 ## 实施顺序建议
 
 | 顺序 | 项 | 理由 |

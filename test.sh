@@ -172,7 +172,9 @@ wk_run() {
         export WK_FAKE_CALLS="$CALLS"
         export WK_RUN_DIR="$TMP_ROOT/run"
         export WK_TMUX=0
-        bash "$WK" "$@"
+        # </dev/null: the fake lxc drains piped stdin (like the real client), so
+        # wk must never inherit the harness's stdin — a held-open one hangs it.
+        bash "$WK" "$@" </dev/null
     ) 2>&1
 }
 
@@ -338,6 +340,141 @@ wk_run ls >/dev/null
 assert_not_called "read-only commands are not"      "logger"
 wk_run verify lxslot1 >/dev/null 2>&1
 assert_not_called "…verify neither"                 "logger"
+
+echo ""
+echo "=== service groups (.wk.yaml) ==="
+GDIR="$TMP_ROOT/grouped"; mkdir -p "$GDIR"
+cat > "$GDIR/.wk.yaml" <<'YAML'
+services:
+  - services/datalake.yml
+services_ci:
+  - services/mysql.yml
+  - services/hive.yml
+networks:
+  - share-net
+smoke_services:
+  - polaris
+  - minio
+smoke_services_ci:
+  - mysql
+YAML
+assert_eq "default group reads services"    "services/datalake.yml" \
+          "$(WK_SOURCE_ONLY=1 bash -c "source '$WK'; service_files '$GDIR'")"
+assert_eq "a named group reads its own key" "2" \
+          "$(WK_SOURCE_ONLY=1 bash -c "source '$WK'; service_files '$GDIR' ci" | wc -l | tr -d ' ')"
+assert_eq "…and does not leak the default"  "services/mysql.yml" \
+          "$(WK_SOURCE_ONLY=1 bash -c "source '$WK'; service_files '$GDIR' ci" | head -1)"
+assert_eq "smoke names follow the group"    "mysql" \
+          "$(WK_SOURCE_ONLY=1 bash -c "source '$WK'; smoke_services '$GDIR' ci")"
+assert_eq "declared groups are listable"    "ci" \
+          "$(WK_SOURCE_ONLY=1 bash -c "source '$WK'; service_groups '$GDIR'")"
+assert_eq "an unknown group finds nothing"  "0" \
+          "$(WK_SOURCE_ONLY=1 bash -c "source '$WK'; service_files '$GDIR' nope" | wc -l | tr -d ' ')"
+
+echo ""
+echo "=== the group reaches the guest that starts the services ==="
+# The guest turns the group into a compose project name (-p). Sharing one
+# project makes compose report the other group's containers as orphans, and a
+# single --remove-orphans would then delete a running stack. The fake cannot see
+# inside the guest, so assert on what the guest is handed: its last argument.
+export WK_FAKE_BOUND="lxslot1=$GDIR lxslot2=/data/beta"
+wk_run up lxslot1 >/dev/null 2>&1
+assert_match "the default group starts its own files"  "services/datalake.yml" "$(tr '\n' ' ' < "$CALLS")"
+assert_not_called "…and is not named as a group"       "bash -s .*datalake.yml ci"
+wk_run up -g ci lxslot1 >/dev/null 2>&1
+assert_match "a named group starts the other files"    "services/mysql.yml" "$(tr '\n' ' ' < "$CALLS")"
+assert_match "…and its name reaches the guest"         "services/hive.yml ci" "$(tr '\n' ' ' < "$CALLS")"
+export WK_FAKE_BOUND="lxslot1=/data/alpha lxslot2=/data/beta"
+
+echo ""
+echo "=== smoke: healthchecks and the probe image ==="
+# The guest script is what decides ready-vs-running, so assert on the arguments
+# it is handed — a dropped one silently disables a check.
+# Point the fixture's bound dir at the .wk.yaml written above, so smoke has
+# services to look for at all.
+export WK_FAKE_BOUND="lxslot1=$GDIR lxslot2=/data/beta"
+# The service list is multi-line, so the recorded call spans lines — match the
+# flattened log rather than a single line of it.
+calls_flat() { tr '\n' ' ' < "$CALLS"; }
+wk_run smoke lxslot1 >/dev/null 2>&1
+assert_match "smoke passes the probe image"      "bash -s polaris minio .* busybox:1.36" "$(calls_flat)"
+wk_run smoke --wait 90 lxslot1 >/dev/null 2>&1
+assert_match "…and the wait budget"              " 90 busybox:1.36" "$(calls_flat)"
+wk_run smoke -w 2m lxslot1 >/dev/null 2>&1
+assert_match "…accepting a duration"             " 120 busybox:1.36" "$(calls_flat)"
+(
+  export WK_PROBE_IMAGE=alpine:3.20
+  wk_run smoke lxslot1 >/dev/null 2>&1
+)
+assert_match "WK_PROBE_IMAGE is honoured"        "alpine:3.20" "$(calls_flat)"
+wk_run up --wait 30 lxslot1 >/dev/null 2>&1
+assert_called "up --wait polls for health"       "exec lxslot1 -- bash -s polaris"
+export WK_FAKE_BOUND="lxslot1=/data/alpha lxslot2=/data/beta"
+
+echo ""
+echo "=== readiness: a broken probe is not a broken service ==="
+# wait_healthy parses `health_states` output on the host, so feed it directly.
+# The verdicts it must tell apart are what decides where a reader looks next.
+ready_out() {
+    WK_FAKE_HEALTH="$1" WK_SOURCE_ONLY=1 bash -c '
+        source "$1"
+        health_states()  { printf "%s\n" "$WK_FAKE_HEALTH"; }
+        bound_dir()      { printf "%s" "/tmp"; }
+        smoke_services() { printf "polaris\nminio\n"; }
+        wait_healthy lxslot1 "" 0
+    ' _ "$WK" 2>&1
+}
+out="$(ready_out 'polaris healthy
+minio healthy')"
+assert_match "all healthy is ready"          "services ready" "$out"
+out="$(ready_out 'polaris none
+minio healthy')"
+assert_match "no healthcheck is not a fault" "services ready" "$out"
+out="$(ready_out 'polaris broken-probe
+minio healthy')"
+assert_match "a broken probe still reports ready" "services ready" "$out"
+assert_match "…and names the compose file as the cause" "CMD-SHELL was meant" "$out"
+out="$(ready_out 'polaris unhealthy
+minio healthy')"
+assert_match "a genuinely unhealthy service fails" "not healthy: polaris" "$out"
+out="$(ready_out 'polaris missing
+minio healthy')"
+assert_match "a missing container fails"     "polaris\(missing\)" "$out"
+out="$(ready_out 'polaris starting
+minio healthy')"
+assert_match "still starting fails with 0 budget" "still starting" "$out"
+
+echo ""
+echo "=== verify: two severities ==="
+# A container that builds but has no agent CLIs is not the same failure as one
+# with no Docker. Conflating them is what made a good build container look dead.
+export WK_FAKE_MISSING="codex claude"
+assert_eq "missing agent CLIs is exit 1"            "1" "$(wk_rc verify lxslot1)"
+out="$(wk_run verify lxslot1)"
+assert_match "…and says builds still work"          "builds still can" "$out"
+export WK_FAKE_MISSING="make"
+assert_eq "a missing make is exit 2"                "2" "$(wk_rc verify lxslot1)"
+out="$(wk_run verify lxslot1)"
+assert_match "…named as unable to build"            "cannot build" "$out"
+
+# A CLI the host does not have either is not the container's fault, and saying
+# so sends the reader to the right place. (This host really has no claude-code.)
+export WK_FAKE_MISSING="codex claude"
+NO_CLI_BIN="$TMP_ROOT/nocli"; mkdir -p "$NO_CLI_BIN"
+for _stub in docker flock ip iptables logger sleep; do
+    ln -sf "$FAKE_DIR/bin/$_stub" "$NO_CLI_BIN/$_stub"
+done
+printf '#!/usr/bin/env bash\nprintf %%s "%s/empty-node-root"\n' "$TMP_ROOT" > "$NO_CLI_BIN/npm"
+chmod +x "$NO_CLI_BIN/npm"
+out="$(
+    unset WK_SOURCE_ONLY
+    PATH="$NO_CLI_BIN:/usr/bin:/bin" WK_LXC="$FAKE_DIR/fake-lxc" \
+    WK_CONFIG=/nonexistent/wk-test-config.env WK_FAKE_CALLS="$CALLS" \
+    WK_RUN_DIR="$TMP_ROOT/run" WK_TMUX=0 bash "$WK" verify lxslot1 2>&1 </dev/null
+)"
+assert_match "a host-side gap is named as such"     "host has none either" "$out"
+unset WK_FAKE_MISSING
+assert_eq "a complete container is exit 0"          "0" "$(wk_rc verify lxslot1)"
 
 echo ""
 echo "=== exec --retry ==="

@@ -14,6 +14,7 @@
 #   WK_FAKE_META         "lxslot1.managed=1 lxslot1.note=hi"   (keys without user.wk.)
 #   WK_FAKE_EXEC_OUT     stdout to emit for `exec`
 #   WK_FAKE_EXEC_RC      exit code for `exec` (default 0)
+#   WK_FAKE_MISSING      tools whose `command -v` must fail, e.g. "codex claude"
 #   WK_FAKE_FAIL         space-separated subcommands that must fail, e.g. "start info"
 #   WK_FAKE_CALLS        file to append invocations to
 set -uo pipefail
@@ -124,6 +125,17 @@ config)
     ;;
 
 exec)
+    # Drain stdin like the real client: wk pipes tar/heredocs into `lxc exec`,
+    # and a fake that exits without reading races the writer into an EPIPE —
+    # a flaky "tar: Write error" that has nothing to do with the code under test.
+    [[ -t 0 ]] || cat >/dev/null
+    # WK_FAKE_MISSING lists tools the container does not have, so a test can
+    # ask what `wk verify` makes of a half-provisioned container.
+    if [[ -n "${WK_FAKE_MISSING:-}" && "$*" == *"command -v "* ]]; then
+        for _m in ${WK_FAKE_MISSING}; do
+            [[ "$*" == *"command -v $_m "* ]] && exit 1
+        done
+    fi
     printf '%s' "${WK_FAKE_EXEC_OUT:-}"
     [[ -n "${WK_FAKE_EXEC_OUT:-}" ]] && printf '\n'
     exit "${WK_FAKE_EXEC_RC:-0}"

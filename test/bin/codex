@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Present so host_has_cli() is deterministic in tests: the assertion under test
+# is what wk does when the *container* lacks the CLI, not what this host has.
+exit 0

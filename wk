@@ -8,6 +8,16 @@ set -Eeuo pipefail
 
 WK_VERSION=2.0.0
 
+# Under systemd (a transient unit, a timer, journald in general) stdout/stderr
+# are sockets — and the LXD client will not forward `lxc exec` output into a
+# socket. Every guest step then runs invisibly, and a failure leaves no trace.
+# Re-piping our own stdio through cat gives children pipes, which lxc accepts;
+# cat inherits the socket and plain writes to it work fine.
+if [[ "${WK_SOURCE_ONLY:-0}" != 1 ]]; then
+    [[ -S /proc/self/fd/1 ]] && exec 1> >(cat)
+    [[ -S /proc/self/fd/2 ]] && exec 2> >(cat >&2)
+fi
+
 # --- Config -------------------------------------------------------------------
 # The config file holds host defaults; a WK_* already in the environment is a
 # deliberate override for this one command and must survive. Sourcing the file
@@ -37,6 +47,9 @@ WK_BRIDGE=${WK_BRIDGE:-lxdbr0}
 WK_SLOTS=${WK_SLOTS:-"lxslot1 lxslot2 lxslot3"}
 WK_IMAGE_CACHE=${WK_IMAGE_CACHE:-$WK_DATA_ROOT/image-cache}
 WK_WARM_IMAGES=${WK_WARM_IMAGES:-}
+# Tiny image `wk smoke` runs its DNS and write probes from. Pinned, because an
+# unpinned tag would silently change what the probe means.
+WK_PROBE_IMAGE=${WK_PROBE_IMAGE:-busybox:1.36}
 WK_CACHE_MAX_GB=${WK_CACHE_MAX_GB:-50}
 
 # URLs `wk doctor` actually fetches to answer "can I build right now?". Port
@@ -497,20 +510,42 @@ wait_docker() {
 # --- Services -----------------------------------------------------------------
 # Compose files are declared by the project itself, in .wk.yaml next to the code.
 # wk deliberately knows nothing about any particular project's layout.
+# A checkout may declare more than one set of services, and they are not
+# interchangeable — an integration stack and a CI fixture set, say, provisioned
+# from different registries. With one flat list, `wk up` starts all of them and
+# one absent image fails the lot: measured on a real host, five images of one
+# stack were not present at all, which would have taken the other stack — whose
+# images were all there — down with them.
+#
+# So a group is just a suffixed key — `services_ci:` alongside `services:` —
+# which the existing list parser reads as-is. No new syntax, and no --group
+# means exactly the old behaviour.
+group_key() {
+    local base=$1 group=${2:-}
+    [[ -n "$group" ]] && printf '%s_%s' "$base" "$group" || printf '%s' "$base"
+}
+
 service_files() {
-    local dir=$1 f
+    local dir=$1 group=${2:-} f
     while read -r f; do
         [[ -n "$f" ]] || continue
         printf '%s\n' "$f"
-    done < <(parse_list_key "$dir/.wk.yaml" services)
+    done < <(parse_list_key "$dir/.wk.yaml" "$(group_key services "$group")")
+}
+
+# Groups a checkout declares, so a wrong --group can say what the right ones are.
+service_groups() {
+    local dir=$1
+    [[ -f "$dir/.wk.yaml" ]] || return 0
+    sed -n 's/^services_\([A-Za-z0-9_-]*\):.*/\1/p' "$dir/.wk.yaml"
 }
 
 smoke_services() {
-    local dir=$1 s
+    local dir=$1 group=${2:-} s
     while read -r s; do
         [[ -n "$s" ]] || continue
         printf '%s\n' "$s"
-    done < <(parse_list_key "$dir/.wk.yaml" smoke_services)
+    done < <(parse_list_key "$dir/.wk.yaml" "$(group_key smoke_services "$group")")
 }
 
 networks_for() {
@@ -526,46 +561,101 @@ networks_for() {
 }
 
 services_up() {
-    local name=$1 dir files nets
+    local name=$1 group=${2:-} dir files nets
     dir="$(bound_dir "$name")" || { warn "$name has no code bound; nothing to start"; return 0; }
-    files="$(service_files "$dir")"
-    [[ -n "$files" ]] || { step "no compose files declared for $dir"; return 0; }
+    files="$(service_files "$dir" "$group")"
+    if [[ -z "$files" ]]; then
+        local have; have="$(service_groups "$dir" | tr '\n' ' ')"
+        if [[ -n "$group" ]]; then
+            die "no services_$group in $dir/.wk.yaml${have:+ (groups: $have)}"
+        fi
+        step "no compose files declared for $dir${have:+ — try --group with one of: $have}"
+        return 0
+    fi
+    [[ -n "$group" ]] && info "group: $group"
 
     wait_docker "$name" || die "Docker daemon is not up in $name"
     nets="$(networks_for "$dir")"
 
     info "starting services in $name"
-    lxc_ exec "$name" -- bash -s "$dir" "$nets" "$files" <<'GUEST'
+    lxc_ exec "$name" -- bash -s "$dir" "$nets" "$files" "$group" <<'GUEST'
 set -Eeuo pipefail
-dir=$1; nets=$2; files=$3
+trap 'echo "guest step failed: $BASH_COMMAND (line $LINENO)" >&2' ERR
+dir=$1; nets=$2; files=$3; group=${4:-}
+# Each group gets its own compose project. Without this they share one (derived
+# from the directory name) and compose reports the other group's containers as
+# orphans — which is not just noise: a single `--remove-orphans` would delete a
+# running stack that belongs to the other group.
+# Only named groups get a suffix; the default group keeps the project name it
+# already had, so containers started before this change stay reachable.
+proj=()
+[[ -n "$group" ]] && proj=(-p "$(basename "$dir" | tr "[:upper:]" "[:lower:]" | tr -c "a-z0-9_-" "-")-$group")
 for n in $nets; do
     docker network create "$n" >/dev/null 2>&1 || true
 done
+
+# Container-to-container traffic must not go through the proxy. The Docker CLI
+# injects HTTP_PROXY into every container it creates (that is how a build gets
+# its public downloads), and a client that honours it sends `http://minio:9000`
+# to the proxy, which has never heard of the host `minio` and answers 502.
+#
+# Measured on this stack: mc read that 502 as a bad alias, silently fell back to
+# localhost:9000, failed with "connection refused", and the init container still
+# exited 0 — both buckets unmade, nothing in the stack's status showing it.
+#
+# The service names are exactly the hostnames used inside the network, and
+# compose can list them, so add those to noProxy before anything starts. Only
+# these names bypass the proxy; everything else still goes through it.
+svc_names="$(while read -r f; do
+    [[ -n "$f" && -f "$dir/$f" ]] || continue
+    docker compose -f "$dir/$f" config --services 2>/dev/null
+done <<<"$files" | sort -u | tr '\n' ',' | sed 's/,$//')"
+
+if [[ -n "$svc_names" && -f /root/.docker/config.json ]] && command -v jq >/dev/null 2>&1; then
+    current="$(jq -r '.proxies.default.noProxy // ""' /root/.docker/config.json 2>/dev/null || true)"
+    missing=''
+    for n in ${svc_names//,/ }; do
+        case ",$current," in *",$n,"*) ;; *) missing="${missing:+$missing,}$n" ;; esac
+    done
+    if [[ -n "$missing" ]]; then
+        tmp="$(mktemp)"
+        if jq --arg np "${current:+$current,}$missing" \
+              '.proxies.default.noProxy = $np' /root/.docker/config.json > "$tmp" 2>/dev/null; then
+            mv "$tmp" /root/.docker/config.json
+            echo "  noProxy += $missing  (service hostnames must not go through the proxy)"
+        else
+            rm -f "$tmp"
+        fi
+    fi
+fi
 while read -r f; do
     [[ -n "$f" ]] || continue
     [[ -f "$dir/$f" ]] || { echo "missing compose file: $dir/$f" >&2; exit 1; }
     docker compose -f "$dir/$f" config -q
     # --pull never: images are provisioned by `wk warm`, so a missing one should
     # fail fast instead of silently going out to the network.
-    docker compose -f "$dir/$f" up -d --pull never --quiet-pull
+    docker compose ${proj[@]+"${proj[@]}"} -f "$dir/$f" up -d --pull never --quiet-pull
 done <<<"$files"
 docker ps --format '{{.Names}}\t{{.Status}}'
 GUEST
 }
 
 services_down() {
-    local name=$1 dir files
+    local name=$1 group=${2:-} dir files
     dir="$(bound_dir "$name")" || return 0
-    files="$(service_files "$dir")"
+    files="$(service_files "$dir" "$group")"
     [[ -n "$files" ]] || return 0
     step "stopping services in $name"
-    lxc_ exec "$name" -- bash -s "$dir" "$files" <<'GUEST'
+    lxc_ exec "$name" -- bash -s "$dir" "$files" "$group" <<'GUEST'
 set -Eeuo pipefail
-dir=$1; files=$2
+trap 'echo "guest step failed: $BASH_COMMAND (line $LINENO)" >&2' ERR
+dir=$1; files=$2; group=${3:-}
+proj=()
+[[ -n "$group" ]] && proj=(-p "$(basename "$dir" | tr "[:upper:]" "[:lower:]" | tr -c "a-z0-9_-" "-")-$group")
 # Reverse order so dependents go down first.
 tac <<<"$files" | while read -r f; do
     [[ -n "$f" && -f "$dir/$f" ]] || continue
-    docker compose -f "$dir/$f" down || true
+    docker compose ${proj[@]+"${proj[@]}"} -f "$dir/$f" down || true
 done
 GUEST
 }
@@ -751,6 +841,7 @@ install_docker() {
     info "installing Docker in $name"
     lxc_ exec "$name" -- bash -s <<'GUEST'
 set -Eeuo pipefail
+trap 'echo "guest step failed: $BASH_COMMAND (line $LINENO)" >&2' ERR
 export DEBIAN_FRONTEND=noninteractive
 
 # The proxy is intermittently flaky; a single apt failure should not cost a
@@ -772,9 +863,14 @@ until ip -4 route show default >/dev/null 2>&1 && getent hosts archive.ubuntu.co
     sleep 1
 done
 
+# The proxy drops individual TLS handshakes under load ("Could not handshake:
+# Error in the pull function"). Retrying the whole apt transaction is the wrong
+# granularity for that — let apt retry each URI by itself first.
+install -d /etc/apt/apt.conf.d
+printf 'Acquire::Retries "10";\n' > /etc/apt/apt.conf.d/96-wk-retries
+
 proxy="${HTTP_PROXY:-${http_proxy:-${HTTPS_PROXY:-${https_proxy:-}}}}"
 if [[ -n "$proxy" ]]; then
-    install -d /etc/apt/apt.conf.d
     printf 'Acquire::http::Proxy "%s";\nAcquire::https::Proxy "%s";\n' "$proxy" "$proxy" \
         > /etc/apt/apt.conf.d/95-wk-proxy
 
@@ -848,6 +944,7 @@ install_tools() {
     info "installing tools in $name"
     lxc_ exec "$name" -- bash -s <<'GUEST'
 set -Eeuo pipefail
+trap 'echo "guest step failed: $BASH_COMMAND (line $LINENO)" >&2' ERR
 export DEBIAN_FRONTEND=noninteractive
 
 retry() {
@@ -861,35 +958,61 @@ retry() {
     return 1
 }
 
+# Also here, not only in install_docker: a rerun on a container that already
+# has Docker skips that step, and this apt must survive proxy flakiness too.
+install -d /etc/apt/apt.conf.d
+printf 'Acquire::Retries "10";\n' > /etc/apt/apt.conf.d/96-wk-retries
+
 # --no-install-recommends matters a lot here: `npm` recommends node-gyp, which
 # drags in gcc, python and even X11 packages — measured at 566 packages / 172 MB
 # on a real build. The agent CLIs are pure JS and need none of it.
 retry apt-get update
-# make earns its place: a project's build entry point is almost always a
-# Makefile, and it runs at this layer — it is the thing that spawns the build
-# container. Without it the build fails with a bare rc=127.
+
+# Two tiers, and the split is the point. Without it, a proxy that drops TLS
+# handshakes takes out `wk new` entirely: measured on a real run, git/make/curl/
+# jq/tmux all installed, only nodejs's 20-odd dependency .debs failed, and the
+# container was thrown away over the agent CLIs — which no build needs.
+#
+# Tier 1 — a build cannot start without these. make earns its place because a
+# project's build entry point is almost always a Makefile and it runs at this
+# layer, spawning the build container; without it the build dies at rc=127.
 retry apt-get install -y --no-install-recommends \
-    git openssh-client ca-certificates curl jq tmux make nodejs npm
+    git openssh-client ca-certificates curl jq tmux make
+
+# Tier 2 — convenience: the agent CLIs (codex/claude) and the forge clients.
+# A failure here is reported and survived, never fatal.
+if ! retry apt-get install -y --no-install-recommends nodejs npm; then
+    echo "  nodejs/npm unavailable — the agent CLIs will be missing, everything else works" >&2
+    echo "  retry later with: wk new <name>   (idempotent)" >&2
+fi
 apt-cache show gh   >/dev/null 2>&1 && apt-get install -y --no-install-recommends gh   || true
 apt-cache show glab >/dev/null 2>&1 && apt-get install -y --no-install-recommends glab || true
+true
 GUEST
 
     # Copying the host's global node_modules is much faster than npm install and
     # pins the same agent version the host runs. npm is the fallback.
-    local pkgs=()
-    [[ -d /usr/lib/node_modules/@openai/codex ]] && pkgs+=(@openai/codex)
-    [[ -d /usr/lib/node_modules/@anthropic-ai/claude-code ]] && pkgs+=(@anthropic-ai/claude-code)
-    if (( ${#pkgs[@]} )); then
-        step "copying agent CLIs from host: ${pkgs[*]}"
+    # `npm -g` does not always mean /usr/lib: Debian's nodejs puts it there,
+    # a hand-built node or a prefix override puts it in /usr/local. Looking in
+    # only one is how a host that has the CLI still gets a container without it.
+    local root pkgs=()
+    for root in "$(npm root -g 2>/dev/null || true)" /usr/lib/node_modules /usr/local/lib/node_modules; do
+        [[ -n "$root" && -d "$root" ]] || continue
+        pkgs=()
+        [[ -d "$root/@openai/codex" ]] && pkgs+=(@openai/codex)
+        [[ -d "$root/@anthropic-ai/claude-code" ]] && pkgs+=(@anthropic-ai/claude-code)
+        (( ${#pkgs[@]} )) || continue
+        step "copying agent CLIs from host: ${pkgs[*]} (from $root)"
         lxc_ exec "$name" -- mkdir -p /usr/lib/node_modules
-        tar -C /usr/lib/node_modules -cpf - "${pkgs[@]}" \
+        tar -C "$root" -cpf - "${pkgs[@]}" \
             | lxc_ exec "$name" -- tar -C /usr/lib/node_modules -xpf -
-    else
-        step "no host codex/claude packages to copy — will install with npm"
-    fi
+        break
+    done
+    (( ${#pkgs[@]} )) || step "the host has no codex/claude package to copy — npm is the fallback"
 
     lxc_ exec "$name" -- bash -s <<'GUEST'
 set -Eeuo pipefail
+trap 'echo "guest step failed: $BASH_COMMAND (line $LINENO)" >&2' ERR
 export DEBIAN_FRONTEND=noninteractive
 
 link_bin() {
@@ -908,34 +1031,94 @@ link_bin claude /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe \
                 /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude \
                 /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js || true
 
-command -v codex  >/dev/null 2>&1 || { echo "installing codex via npm";  npm install -g @openai/codex; }
-command -v claude >/dev/null 2>&1 || { echo "installing claude via npm"; npm install -g @anthropic-ai/claude-code; }
+# npm through a flaky proxy fails often, and these two packages are convenience
+# only — no build needs them. Under `set -e` a failed npm used to take the whole
+# container with it: measured, a container with a working Docker, git and make
+# was discarded because one npm install could not reach the registry.
+npm_try() {
+    local pkg=$1 i
+    command -v npm >/dev/null 2>&1 || { echo "  no npm — cannot install $pkg" >&2; return 1; }
+    # claude-code requires node >= 22; Ubuntu 24.04 ships 18. Saying so up front
+    # matters: the npm log blames the network, so a reader fixes the proxy and
+    # tries again, and it fails again for a reason npm never mentioned.
+    if [[ "$pkg" == @anthropic-ai/claude-code ]]; then
+        local major; major="$(node -v 2>/dev/null | sed 's/^v//; s/\..*//')"
+        if [[ -n "$major" ]] && (( major < 22 )); then
+            echo "  node $major is too old for $pkg (needs >= 22); apt only has 18 here." >&2
+            echo "  install it on the host instead — wk copies the host's package in." >&2
+            return 1
+        fi
+    fi
+    for i in 1 2 3; do
+        npm install -g "$pkg" && return 0
+        echo "  npm attempt $i/3 failed: $pkg" >&2
+        sleep 10
+    done
+    return 1
+}
+
+command -v codex  >/dev/null 2>&1 || npm_try @openai/codex             || true
+command -v claude >/dev/null 2>&1 || npm_try @anthropic-ai/claude-code || true
 
 for c in codex claude; do
-    command -v "$c" >/dev/null 2>&1 || echo "WARN: $c is still missing after install" >&2
+    command -v "$c" >/dev/null 2>&1 \
+        || echo "WARN: $c is not available in this container (builds are unaffected)" >&2
 done
+true
 GUEST
 }
 
 # Report whether a container is actually usable. Machine-friendly: non-zero exit
 # when something an agent would depend on is missing.
+# wk seeds a container from the host; what the host does not have, it cannot
+# seed. Reporting such a gap as the container's fault sends the reader looking
+# in the wrong place — this host has no claude-code installed at all.
+host_has_cli() {
+    local c=$1 root
+    command -v "$c" >/dev/null 2>&1 && return 0
+    for root in "$(npm root -g 2>/dev/null || true)" /usr/lib/node_modules /usr/local/lib/node_modules; do
+        [[ -n "$root" && -d "$root" ]] || continue
+        case "$c" in
+            codex)  [[ -d "$root/@openai/codex" ]]              && return 0 ;;
+            claude) [[ -d "$root/@anthropic-ai/claude-code" ]]   && return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Two severities, and the exit code tells them apart:
+#   2  broken — the container cannot build anything
+#   1  incomplete — it builds fine, but an agent's own tooling is missing
+#   0  everything present
+# The distinction is not cosmetic. A flaky proxy that loses nodejs's .debs
+# leaves a perfectly good build container; treating that the same as a dead
+# Docker daemon is what made a whole `wk new` look like a failure.
 verify_slot() {
-    local name=$1 failed=0
+    local name=$1 broken=0 incomplete=0
 
     if lxc_ exec "$name" -- docker info >/dev/null 2>&1; then
         ok "docker daemon"
     else
-        bad "docker daemon not responding"; failed=1
+        bad "docker daemon not responding"; broken=1
     fi
 
     local c
-    for c in codex claude gh glab git tmux; do
+    for c in git make tmux codex claude gh glab; do
         if lxc_ exec "$name" -- bash -lc "command -v $c >/dev/null 2>&1"; then
             ok "$c"
         else
             case "$c" in
-                codex|claude|git) bad "$c missing"; failed=1 ;;
-                *)                hint "$c missing (optional)" ;;
+                # A build needs these: make is the entry point of nearly every
+                # project's build, and it runs at this layer.
+                git|make)      bad "$c missing — this container cannot build"; broken=1 ;;
+                codex|claude)
+                    if host_has_cli "$c"; then
+                        bad "$c missing — agents cannot work in here (builds still can)"
+                        incomplete=1
+                    else
+                        hint "$c missing — the host has none either, so wk cannot seed it (builds unaffected)"
+                    fi ;;
+                *)             hint "$c missing (optional)" ;;
             esac
         fi
     done
@@ -943,18 +1126,21 @@ verify_slot() {
     if lxc_ exec "$name" -- bash -lc '[[ -s /root/.codex/auth.json || -s /root/.claude/.credentials.json ]]'; then
         ok "agent credentials present"
     else
-        bad "no agent credentials — run: wk auth $name (after logging in on the host)"; failed=1
+        bad "no agent credentials — run: wk auth $name (after logging in on the host)"
+        incomplete=1
     fi
 
     if proxy_endpoint >/dev/null; then
         if proxy_reachable_from "$name"; then
             ok "proxy reachable from inside"
         else
-            bad "proxy NOT reachable from inside"; failed=1
+            bad "proxy NOT reachable from inside"; broken=1
         fi
     fi
 
-    return $(( failed ))
+    (( broken )) && return 2
+    (( incomplete )) && return 1
+    return 0
 }
 
 seed_auth() {
@@ -1053,29 +1239,39 @@ cmd_new() {
     ensure_running "$name"
 
     if ! lxc_ exec "$name" -- docker info >/dev/null 2>&1; then
-        install_docker "$name"
+        install_docker "$name" || die "installing Docker in $name failed — see the guest error above; wk new is idempotent, re-run it to continue"
     else
         step "Docker already present"
     fi
-    install_tools "$name"
-    seed_auth "$name"
-    warm_images "$name"
+    install_tools "$name" || die "installing tools in $name failed — see the guest error above; wk new is idempotent, re-run it to continue"
+    seed_auth "$name"    || die "seeding credentials into $name failed"
+    warm_images "$name"  || die "warming images into $name failed"
+    # `wk smoke` needs this to prove in-network DNS and uid-1000 write access.
+    # A few MB, and fetching it now beats a smoke test that cannot run later.
+    lxc_ exec "$name" -- bash -lc "docker image inspect $WK_PROBE_IMAGE >/dev/null 2>&1 \
+        || docker pull -q $WK_PROBE_IMAGE >/dev/null" \
+        || warn "could not fetch the smoke probe image ($WK_PROBE_IMAGE) — wk smoke will not be able to run its DNS and write checks"
     touch_active "$name"
 
     printf '\n%sverifying %s%s\n' "$BOLD" "$name" "$RESET"
-    local ready=0
-    verify_slot "$name" || ready=1
+    local health=0
+    verify_slot "$name" || health=$?
 
     printf '\n'
     printf '  bind code:  %swk bind %s /path/to/your/clone --chown%s\n' "$CYAN" "$name" "$RESET"
     printf '  go inside:  %swk enter %s%s\n' "$CYAN" "$name" "$RESET"
 
-    if (( ready )); then
-        warn "$name was built but is not fully usable — see the failed checks above"
-        return 1
-    fi
-    info "$name is ready"
     audit "new $name"
+    case $health in
+        0) info "$name is ready" ;;
+        # Worth saying plainly: this container compiles. Reporting it as a
+        # failure is what sent a working build environment to the bin.
+        1) warn "$name can build, but an agent's own tooling is incomplete — see above"
+           hint "re-run to fill in what is missing (idempotent): wk new $name"
+           return 1 ;;
+        *) warn "$name is not usable — see the failed checks above"
+           return 2 ;;
+    esac
 }
 
 cmd_rm() {
@@ -1438,42 +1634,148 @@ cmd_warm() {
     audit "warm $name"
 }
 
+# One arg parser for the three commands that take a service group.
+parse_group_args() {
+    GROUP=''; SLOT=''; WAIT=0
+    while (( $# )); do
+        case "$1" in
+            --group|-g) GROUP=${2:-}; shift 2 ;;
+            --wait|-w)  WAIT="$(parse_duration "${2:-0}")"; shift 2 ;;
+            -*)         die "unknown flag: $1" ;;
+            *)          SLOT=$1; shift ;;
+        esac
+    done
+}
+
 cmd_up() {
-    local name=${1:-}
+    parse_group_args "$@"
+    local name=$SLOT
     require_slot "$name"
     lock_slot "$name" x
     ensure_running "$name"
     touch_active "$name"
-    services_up "$name"
+    services_up "$name" "$GROUP"
+    # `compose up -d` returns as soon as the containers start, which for this
+    # stack is a minute before anything answers. Waiting here is what makes
+    # "up finished" mean "usable".
+    (( WAIT > 0 )) && wait_healthy "$name" "$GROUP" "$WAIT"
+    return 0
+}
+
+# One lxc exec, one line per service: "<name> <verdict>".
+#
+# verdict is deliberately more than healthy/unhealthy, because a healthcheck can
+# fail in a way that says nothing about the service. This project's hiveserver2
+# declares
+#     test: ["CMD", "bash -c '...' || exit 1"]
+# where CMD takes one argv element per array item, so docker tries to exec a file
+# literally named `bash -c '...' || exit 1` and reports ExitCode -1. Measured on
+# a running stack: the probe had never once succeeded while port 10000 was open
+# the whole time. Calling that "not ready" sends the reader to hive; the fault is
+# in the yaml, and only `broken-probe` says so.
+health_states() {
+    local name=$1 names=$2
+    lxc_ exec "$name" -- bash -s "$names" <<'GUEST'
+set -uo pipefail
+names=$1
+while read -r n; do
+    [[ -n "$n" ]] || continue
+    if [[ "$(docker inspect -f '{{.State.Running}}' "$n" 2>/dev/null)" != true ]]; then
+        printf '%s missing\n' "$n"; continue
+    fi
+    st="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{end}}' "$n" 2>/dev/null || true)"
+    if [[ -z "$st" ]]; then printf '%s none\n' "$n"; continue; fi
+    if [[ "$st" != healthy ]]; then
+        # Every recorded attempt, not just the last: Go templates reject a
+        # negative index (`index .Log -1` is a template error, not the last
+        # element), and a probe that cannot be executed fails identically every
+        # time anyway — measured: [-1][-1][-1][-1][-1].
+        log="$(docker inspect -f '{{range .State.Health.Log}}{{.ExitCode}} {{.Output}}
+{{end}}' "$n" 2>/dev/null || true)"
+        case "$log" in
+            *"OCI runtime exec failed"*|*"executable file not found"*|*"not found in $PATH"*)
+                printf '%s broken-probe\n' "$n"; continue ;;
+        esac
+    fi
+    printf '%s %s\n' "$n" "$st"
+done <<<"$names"
+GUEST
+}
+
+# Wait until every service is either healthy, has no healthcheck, or has one that
+# cannot run. Returns 1 only when something is genuinely wrong or still starting.
+wait_healthy() {
+    local name=$1 group=$2 secs=$3 dir names deadline=0 line n verdict
+    dir="$(bound_dir "$name")" || return 0
+    names="$(smoke_services "$dir" "$group")"
+    [[ -n "$names" ]] || return 0
+    (( secs > 0 )) && info "waiting up to ${secs}s for services to become healthy"
+    deadline=$(( SECONDS + secs ))
+    local pending broken sick reported=0
+    while :; do
+        pending=''; broken=''; sick=''
+        while read -r line; do
+            [[ -n "$line" ]] || continue
+            n=${line%% *}; verdict=${line##* }
+            case "$verdict" in
+                healthy|none)  ;;
+                starting)      pending="$pending $n" ;;
+                broken-probe)  broken="$broken $n" ;;
+                *)             sick="$sick $n($verdict)" ;;
+            esac
+        done < <(health_states "$name" "$names")
+
+        if [[ -n "$broken" && $reported -eq 0 ]]; then
+            reported=1
+            warn "healthcheck cannot run for:$broken"
+            hint "that is the healthcheck's own definition (CMD where CMD-SHELL was meant), not a failing service"
+            hint "check the service itself separately: wk dexec $name <container> <cmd>"
+        fi
+        [[ -z "$pending" && -z "$sick" ]] && { info "services ready${broken:+ (probe unusable for:$broken)}"; return 0; }
+        [[ -n "$sick" ]] && { warn "not healthy:$sick"; return 1; }
+        (( SECONDS < deadline )) || { warn "still starting after ${secs}s:$pending"; return 1; }
+        step "waiting for:$pending"
+        sleep 5
+    done
 }
 
 cmd_down() {
-    local name=${1:-}
+    parse_group_args "$@"
+    local name=$SLOT
     require_slot "$name"
     lock_slot "$name" x
     [[ "$(slot_state "$name")" == RUNNING ]] || { info "$name is not running"; return 0; }
-    services_down "$name"
-    info "services stopped in $name"
-    audit "down $name"
+    services_down "$name" "$GROUP"
+    info "services stopped in $name${GROUP:+ (group: $GROUP)}"
+    audit "down $name${GROUP:+ --group $GROUP}"
 }
 
 cmd_smoke() {
-    local name=${1:-}
+    parse_group_args "$@"
+    local name=$SLOT
     require_slot "$name"
     lock_slot "$name" s
     ensure_running "$name"
     local dir names nets
     dir="$(bound_dir "$name")" || die "$name has no code bound"
-    names="$(smoke_services "$dir")"
-    [[ -n "$names" ]] || die "no smoke_services declared in $dir/.wk.yaml — nothing to check"
+    names="$(smoke_services "$dir" "$GROUP")"
+    [[ -n "$names" ]] || die "no $(group_key smoke_services "$GROUP") declared in $dir/.wk.yaml — nothing to check"
     nets="$(networks_for "$dir" | head -1)"
 
     info "smoke test in $name"
-    lxc_ exec "$name" -- bash -s "$names" "$nets" "$dir" "$WK_CODE_UID:$WK_CODE_GID" <<'GUEST'
+    # Readiness first, and with the wait budget: probing DNS or exec against a
+    # service that has not finished starting fails for a reason that is not a
+    # fault. A broken probe is reported, not treated as failure.
+    wait_healthy "$name" "$GROUP" "$WAIT" || die "services are not ready in $name — see above"
+    lxc_ exec "$name" -- bash -s "$names" "$nets" "$dir" "$WK_CODE_UID:$WK_CODE_GID" "$WAIT" "$WK_PROBE_IMAGE" <<'GUEST'
 set -Eeuo pipefail
-names=$1; net=$2; dir=$3; owner=$4
+trap 'echo "guest step failed: $BASH_COMMAND (line $LINENO)" >&2' ERR
+names=$1; net=$2; dir=$3; owner=$4; wait_for=${5:-0}; probe_image=${6:-busybox:1.36}
 flat="$(tr '\n' ' ' <<<"$names")"
 
+# Readiness (Running + healthchecks) is judged on the host by wait_healthy, which
+# also knows a broken probe from a broken service. Here we only check what needs
+# to be checked from inside: network membership, exec/cp, DNS, write access.
 while read -r n; do
     [[ -n "$n" ]] || continue
     [[ "$(docker inspect -f '{{.State.Running}}' "$n" 2>/dev/null)" == true ]] \
@@ -1483,7 +1785,7 @@ while read -r n; do
             || { echo "$n is not on network $net" >&2; exit 1; }
     fi
 done <<<"$names"
-echo "PASS services running"
+echo "PASS services running, on $net"
 
 probe="$(head -1 <<<"$names")"
 docker cp /etc/hosts "$probe:/tmp/wk-probe"
@@ -1494,15 +1796,19 @@ rm -f /tmp/wk-probe.out
 docker exec "$probe" rm -f /tmp/wk-probe
 echo "PASS docker exec + docker cp"
 
-if docker image inspect busybox:1.36 >/dev/null 2>&1; then
+if ! docker image inspect "$probe_image" >/dev/null 2>&1; then
+    echo "  pulling the probe image: $probe_image"
+    docker pull -q "$probe_image" >/dev/null 2>&1 || true
+fi
+if docker image inspect "$probe_image" >/dev/null 2>&1; then
     if [[ -n "$net" ]]; then
         # shellcheck disable=SC2086
-        docker run --rm --network "$net" busybox:1.36 sh -c \
+        docker run --rm --network "$net" "$probe_image" sh -c \
             'for h in "$@"; do nslookup "$h" 127.0.0.11 >/dev/null || exit 1; done' _ $flat
         echo "PASS in-network DNS"
     fi
     # Verify the write the same way the compile image does it: as uid 1000.
-    if docker run --rm -u "$owner" -v "$dir:/w" busybox:1.36 \
+    if docker run --rm -u "$owner" -v "$dir:/w" "$probe_image" \
             sh -c 'touch /w/.wk-write-probe && rm -f /w/.wk-write-probe'; then
         echo "PASS code dir writable as $owner"
     else
@@ -1510,7 +1816,12 @@ if docker image inspect busybox:1.36 >/dev/null 2>&1; then
         exit 1
     fi
 else
-    echo "SKIP DNS and write checks (busybox:1.36 not present)"
+    # Silently skipping these made a smoke test pass while nothing was proven:
+    # in-network DNS and uid-1000 write access are exactly the two failures that
+    # otherwise surface an hour later, inside a build.
+    echo "FAIL cannot check in-network DNS or write access: $probe_image is unavailable" >&2
+    echo "     the container could not pull it either — check egress, or set WK_PROBE_IMAGE" >&2
+    exit 1
 fi
 GUEST
 }
@@ -1779,16 +2090,16 @@ Troubleshooting:
   wk exec [--retry N] <c> <cmd...>
                                run a command inside the container
   wk dexec <c> <docker> <cmd>  run a command inside one of its Docker containers
-  wk up|down <c>               start/stop project services only
+  wk up|down [-g <grp>] <c>    start/stop project services (a group at a time)
   wk verify <c>                is it usable? docker, agent CLIs, credentials, proxy
-  wk smoke <c>                 verify services, DNS, docker exec/cp, write access
+  wk smoke [-g <grp>] <c>      verify services, DNS, docker exec/cp, write access
   wk warm <c> [--from <src>]   load cached images, or stream them from another container
   wk cache ls|prune            list / LRU-trim the host image cache
   wk note <c> [text]           get/set the note shown in wk ls
 
 Config: $WK_CONFIG (shell vars; environment overrides)
   WK_POOL WK_DATA_ROOT WK_IMAGE WK_SLOTS WK_WARM_IMAGES WK_NETWORKS
-  WK_CODE_UID WK_CODE_GID WK_MEM_SAFETY WK_PROXY WK_NO_PROXY
+  WK_CODE_UID WK_CODE_GID WK_MEM_SAFETY WK_PROXY WK_NO_PROXY WK_PROBE_IMAGE
 
 Note: containers are privileged (required for nested Docker). Treat them as a
 trusted local environment, not as a multi-tenant security boundary.
