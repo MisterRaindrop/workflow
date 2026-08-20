@@ -211,6 +211,20 @@ wk up -g ci <c>            # just the CI stack
 
 Without `-g`, behaviour is exactly as before.
 
+### Shell config, and when it takes effect
+
+The credential set is copied to `/root`, where wk's own commands land. Two
+harmless dotfiles — `.tmux.conf` and `.inputrc` — go further: to every real
+user in the container (uid ≥ 1000), because a login as that user would
+otherwise get a tmux with none of the host's settings and no way to reach the
+file in `/root`. Credentials deliberately do not travel that way; a second user
+is not necessarily you.
+
+tmux reads its config exactly once, when the server starts, so a session left
+over from before the file arrived keeps the old settings. `wk auth` reloads a
+running server after seeding — the difference between the config being present
+and it being in effect when you log in.
+
 ## Sharing a host directory (WK_MOUNTS)
 
 Some things belong on the host and should be visible in every container without

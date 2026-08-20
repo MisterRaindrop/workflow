@@ -1220,6 +1220,44 @@ done
 [[ -d /root/.ssh ]] && find /root/.ssh -type f ! -name "*.pub" -exec chmod 600 {} +
 true
 '
+    seed_shell_config "$name"
+}
+
+# The shell config for every real user in the container, not just root.
+#
+# A login as uid 1000 (ubuntu, on this image) would otherwise get a tmux with
+# none of the host's settings — the file is in /root, where that user cannot
+# reach it. Only the harmless dotfiles travel this way; credentials stay in
+# /root deliberately, because a second user is not necessarily you.
+#
+# tmux also reads its config exactly once, when the server starts. A session
+# left over from before the file arrived keeps the old settings, so reload it —
+# that is the difference between "the config is present" and "the config is in
+# effect when I log in".
+seed_shell_config() {
+    local name=$1
+    lxc_ exec "$name" -- bash -s <<'GUEST' || true
+set -uo pipefail
+copied=''
+while IFS=: read -r user _ uid _ _ home _; do
+    [[ "$uid" =~ ^[0-9]+$ ]] || continue
+    (( uid >= 1000 && uid < 65534 )) || continue
+    [[ -n "$home" && -d "$home" && "$home" != / ]] || continue
+    for f in .tmux.conf .inputrc; do
+        [[ -f "/root/$f" ]] || continue
+        cp -f "/root/$f" "$home/$f" 2>/dev/null || continue
+        chown "$uid:$uid" "$home/$f" 2>/dev/null || true
+        copied="$copied $user:$f"
+    done
+done < /etc/passwd
+[[ -n "$copied" ]] && echo "  shell config for:$copied"
+
+if [[ -f /root/.tmux.conf ]] && command -v tmux >/dev/null 2>&1; then
+    tmux source-file /root/.tmux.conf 2>/dev/null \
+        && echo "  reloaded the running tmux server" || true
+fi
+true
+GUEST
 }
 
 # The host's tar cache, mounted read-only into a container. The loader reads

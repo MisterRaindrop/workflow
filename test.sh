@@ -458,7 +458,13 @@ assert_called "clones with --stateless"          "^copy lxslot1 lxslot9 --statel
 assert_called "drops the inherited code mount"   "config device remove lxslot9 wk-source"
 assert_called "clears the copied machine-id"     "file push - lxslot9/etc/machine-id"
 assert_called "re-seeds credentials"             "exec lxslot9 -- tar"
-assert_not_called "…and never runs apt"          "exec lxslot9 -- bash -s"
+# The point of cloning is that none of the provisioning runs. `bash -s` is no
+# longer a proxy for that (seeding shell config uses it too), so assert on what
+# the provisioning would say.
+out="$(wk_run new lxslot9 --from lxslot1 2>&1)"
+assert_eq "…and installs nothing"                "0" \
+          "$(grep -c 'installing \(Docker\|tools\)' <<<"$out" | tr -d ' ')"
+assert_match "…it says it is cloning"            "cloning lxslot1 into lxslot9" "$out"
 unset WK_AUTH_HOME
 out="$(wk_run new lxslot1 --from lxslot2 2>&1)"
 assert_match "refuses to overwrite an existing"  "already exists" "$out"
@@ -617,6 +623,9 @@ assert_called "seeds the extra dotfile"        "exec lxslot1 -- tar"
 printf 'set -g mouse on\n' > "$SEED_HOME/.tmux.conf"
 out="$(WK_SEED_PATHS="" wk_run auth lxslot1 2>&1)"
 assert_match "…and tmux.conf without being asked" "seeding credentials" "$out"
+# Present is not the same as in effect: tmux reads its config only when the
+# server starts, and a login lands on whatever server is already running.
+assert_called "…then reloads what is running"      "exec lxslot1 -- bash -s"
 out="$(wk_run auth lxslot1 2>&1)"
 assert_match "…and says what it is doing"      "seeding credentials and config" "$out"
 
