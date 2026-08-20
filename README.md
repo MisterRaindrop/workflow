@@ -211,6 +211,35 @@ wk up -g ci <c>            # just the CI stack
 
 Without `-g`, behaviour is exactly as before.
 
+## Sharing a host directory (WK_MOUNTS)
+
+Some things belong on the host and should be visible in every container without
+a copy in each: a tool tree, an MCP server, a shared vault.
+
+```bash
+WK_MOUNTS="/opt/some-tool:ro /root/.some-vault"
+```
+
+Each entry is `source[:/target][:ro]`. **Same path on both sides is the
+default, and usually what you want** — a tool configured on the host refers to
+itself by absolute path, so a server registered as
+`/root/.vault/x/server.js` has to be at that exact path inside too, or the
+config that arrived with the credentials points at nothing.
+
+```bash
+wk mount            # attach them to containers that already exist
+```
+
+Note the difference from `WK_SEED_PATHS`, which **copies**: each container gets
+its own and they may diverge, which is right for credentials. A mount **shares**
+one directory — changes appear everywhere at once, which is what you want for a
+tool and what you have to think about for writable data.
+
+The image cache is mounted the same way, read-only, so a tar is read in place
+rather than copied in first. Measured on a 13GB image: the copy alone took 95
+seconds and needed 13GB of transient space inside the container. What it does
+not save is the unpacking — that is 264 seconds, and only cloning avoids it.
+
 ## Cloning a ready container
 
 Building a container from scratch costs about 26 minutes — 20 of apt, 6 of

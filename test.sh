@@ -383,6 +383,70 @@ assert_eq "an unknown group finds nothing"  "0" \
           "$(WK_SOURCE_ONLY=1 bash -c "source '$WK'; service_files '$GDIR' nope" | wc -l | tr -d ' ')"
 
 echo ""
+echo "=== WK_MOUNTS: share a host directory instead of copying it ==="
+MNT_A="$TMP_ROOT/tool"; MNT_B="$TMP_ROOT/vault"; mkdir -p "$MNT_A" "$MNT_B"
+(
+  export WK_MOUNTS="$MNT_A:/opt/tool:ro $MNT_B:/root/vault"
+  wk_run mount lxslot1 >/dev/null 2>&1
+)
+assert_called "read-only entries pass readonly"  "device add lxslot1 wk-m-opt-tool disk source=.*/tool path=/opt/tool readonly=true"
+assert_called "read-write entries do not"        "device add lxslot1 wk-m-root-vault disk source=.*/vault path=/root/vault$"
+# The device name comes from the target path, so reordering the list cannot make
+# an existing device point somewhere else.
+(
+  export WK_MOUNTS="$MNT_B:/root/vault $MNT_A:/opt/tool:ro"
+  wk_run mount lxslot1 >/dev/null 2>&1
+)
+assert_called "names follow the target, not order" "device add lxslot1 wk-m-opt-tool"
+out="$(
+  export WK_MOUNTS="/nope/missing:/opt/x:ro"
+  wk_run mount lxslot1 2>&1
+)"
+assert_match "a missing source is skipped"       "not on this host" "$out"
+# Same path on both sides is the default, and the reason it is: a host tool
+# refers to itself by absolute path, so the config seeded with the credentials
+# only resolves if the path matches.
+(
+  export WK_MOUNTS="$MNT_A"
+  wk_run mount lxslot1 >/dev/null 2>&1
+)
+assert_called "one path means mount it at itself" "disk source=.*/tool path=.*/tool$"
+(
+  export WK_MOUNTS="$MNT_A:ro"
+  wk_run mount lxslot1 >/dev/null 2>&1
+)
+assert_called "…and :ro still applies"           "disk source=.*/tool path=.*/tool readonly=true"
+out="$(
+  export WK_MOUNTS="$MNT_A:relative/target"
+  wk_run mount lxslot1 2>&1
+)"
+assert_match "a relative target is refused"      "cannot read" "$out"
+
+echo ""
+echo "=== warm: read the cache in place, do not copy it in ==="
+# Copying a 13GB tar into the container cost 95 seconds against 63 for the load
+# itself, plus 13GB of transient space there. Mounting the cache read-only
+# removes both.
+WARM_CACHE="$TMP_ROOT/warmcache"; mkdir -p "$WARM_CACHE"
+printf 'x' > "$WARM_CACHE/repo_img__tag.tar"
+(
+  export WK_IMAGE_CACHE="$WARM_CACHE" WK_WARM_IMAGES="repo/img:tag" WK_FAKE_NO_IMAGES=1
+  wk_run warm lxslot1 >/dev/null 2>&1
+)
+assert_called "mounts the cache read-only"      "device add lxslot1 wk-images disk .*readonly=true"
+assert_called "loads straight from the mount"   "docker image load -i /mnt/wk-images/repo_img__tag.tar"
+assert_not_called "…and never pushes the tar"   "^file push"
+# An image already in the container is not reloaded. A tar's contents cannot
+# change unless someone replaces it, so asking the container what it has beats
+# hashing the file — and WK_REFRESH_IMAGE_CACHE is how you say it was replaced.
+out="$(
+  export WK_IMAGE_CACHE="$WARM_CACHE" WK_WARM_IMAGES="repo/img:tag"
+  wk_run warm lxslot1 2>&1
+)"
+assert_match "an image already there is skipped" "already in lxslot1" "$out"
+assert_not_called "…nothing is loaded again"     "docker image load"
+
+echo ""
 echo "=== new --from: clone instead of provision ==="
 # Cloning replaces ~26 minutes of apt and image loading with a copy. What must
 # not be inherited is the source's identity or its bound checkout.
@@ -548,6 +612,11 @@ export WK_AUTH_HOME="$SEED_HOME"
 export WK_SEED_PATHS=".tmux.conf"
 wk_run auth lxslot1 >/dev/null 2>&1
 assert_called "seeds the extra dotfile"        "exec lxslot1 -- tar"
+# wk installs tmux, so its config travels with it — without depending on each
+# host remembering to list it.
+printf 'set -g mouse on\n' > "$SEED_HOME/.tmux.conf"
+out="$(WK_SEED_PATHS="" wk_run auth lxslot1 2>&1)"
+assert_match "…and tmux.conf without being asked" "seeding credentials" "$out"
 out="$(wk_run auth lxslot1 2>&1)"
 assert_match "…and says what it is doing"      "seeding credentials and config" "$out"
 

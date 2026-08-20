@@ -15,6 +15,7 @@
 #   WK_FAKE_EXEC_OUT     stdout to emit for `exec`
 #   WK_FAKE_EXEC_RC      exit code for `exec` (default 0)
 #   WK_FAKE_MISSING      tools whose `command -v` must fail, e.g. "codex claude"
+#   WK_FAKE_NO_IMAGES    make `docker image inspect` fail (container has no images)
 #   WK_FAKE_FAIL         space-separated subcommands that must fail, e.g. "start info"
 #   WK_FAKE_CALLS        file to append invocations to
 set -uo pipefail
@@ -124,7 +125,15 @@ config)
             ;;
         get)
             name=${4:-}
-            [[ "${6:-}" == source ]] && { bound_of "$name" || true; }
+            # Only the code mount answers with a path. Any other device name is
+            # reported as absent, which is what lets a test see wk deciding to
+            # add one (the image-cache mount, for instance).
+            if [[ "${6:-}" == source ]]; then
+                case "${5:-}" in
+                    "$(devname)") bound_of "$name" || exit 1 ;;
+                    *) exit 1 ;;
+                esac
+            fi
             ;;
         add|remove) : ;;
         esac
@@ -140,6 +149,9 @@ exec)
     [[ -t 0 ]] || cat >/dev/null
     # WK_FAKE_MISSING lists tools the container does not have, so a test can
     # ask what `wk verify` makes of a half-provisioned container.
+    if [[ "${WK_FAKE_NO_IMAGES:-0}" == 1 && "$*" == *"docker image inspect"* ]]; then
+        exit 1
+    fi
     if [[ -n "${WK_FAKE_MISSING:-}" && "$*" == *"command -v "* ]]; then
         for _m in ${WK_FAKE_MISSING}; do
             [[ "$*" == *"command -v $_m "* ]] && exit 1

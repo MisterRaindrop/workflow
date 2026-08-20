@@ -50,6 +50,10 @@ WK_WARM_IMAGES=${WK_WARM_IMAGES:-}
 # Tiny image `wk smoke` runs its DNS and write probes from. Pinned, because an
 # unpinned tag would silently change what the probe means.
 WK_PROBE_IMAGE=${WK_PROBE_IMAGE:-busybox:1.36}
+# Where the host's tar cache appears inside a container. Mounted read-only, so
+# the loader reads each tar in place instead of it being copied in first.
+WK_IMAGE_MOUNT=${WK_IMAGE_MOUNT:-/mnt/wk-images}
+WK_IMAGE_DEVICE=wk-images
 WK_CACHE_MAX_GB=${WK_CACHE_MAX_GB:-50}
 
 # URLs `wk doctor` actually fetches to answer "can I build right now?". Port
@@ -61,6 +65,18 @@ WK_NETWORKS=${WK_NETWORKS:-}
 # credential set below is always included; this is for everything else you want
 # to find inside — shell, editor and tmux config, for instance. Space separated.
 WK_SEED_PATHS=${WK_SEED_PATHS:-}
+
+# Host directories to expose inside every container, as "source:target[:ro]"
+# entries, space separated. This is how something that lives on the host — an
+# MCP server, a shared vault, a tool tree — becomes available in every container
+# without a copy in each one. A directory that does not exist is skipped with a
+# warning rather than failing the container.
+#
+# Mind the difference from WK_SEED_PATHS: seeding copies (each container gets
+# its own, divergence is fine and expected — credentials work this way), while
+# mounting shares one directory (changes are visible everywhere at once, which
+# is what you want for a tool and what you must think about for writable data).
+WK_MOUNTS=${WK_MOUNTS:-}
 
 WK_CODE_UID=${WK_CODE_UID:-1000}
 WK_CODE_GID=${WK_CODE_GID:-1000}
@@ -1173,6 +1189,12 @@ seed_auth() {
     for p in .config/gh .config/glab-cli .ssh; do
         [[ -d "$home/$p" ]] && paths+=("$p")
     done
+    # wk installs tmux, so it should bring tmux's config too — otherwise every
+    # container has the tool with none of the keybindings, and getting it there
+    # depends on each host remembering to list it in WK_SEED_PATHS.
+    for p in .tmux.conf .config/tmux/tmux.conf .inputrc; do
+        [[ -f "$home/$p" ]] && paths+=("$p")
+    done
     # Whatever the operator asked for on top of the credentials.
     # shellcheck disable=SC2086
     for p in $WK_SEED_PATHS; do
@@ -1200,6 +1222,68 @@ true
 '
 }
 
+# The host's tar cache, mounted read-only into a container. The loader reads
+# each tar in place, which removes both halves of a cost that bought nothing:
+# copying a 13GB tar in took 95 seconds against 63 for the load itself, and it
+# needed 13GB of transient space inside the container on top of the 27GB the
+# image unpacks to.
+#
+# Read-only is the whole safety story. Nothing in the container can alter the
+# cache, and several containers reading the same tar do not interact — unlike
+# sharing /var/lib/docker, where two daemons would rewrite each other's
+# metadata.
+ensure_image_mount() {
+    local name=$1
+    [[ -d "$WK_IMAGE_CACHE" ]] || return 1
+    lxc_ config device get "$name" "$WK_IMAGE_DEVICE" source >/dev/null 2>&1 && return 0
+    lxc_ config device add "$name" "$WK_IMAGE_DEVICE" disk \
+        source="$WK_IMAGE_CACHE" path="$WK_IMAGE_MOUNT" readonly=true >/dev/null 2>&1
+}
+
+# Attach every WK_MOUNTS entry. Device names are derived from the target path so
+# they stay stable when the list is reordered — an index would silently point an
+# existing device at a different source.
+ensure_mounts() {
+    local name=$1 entry src dst mode dev
+    local -a parts args
+    # shellcheck disable=SC2086  # WK_MOUNTS is a space-separated list
+    for entry in $WK_MOUNTS; do
+        IFS=: read -r -a parts <<<"$entry"
+        src=${parts[0]:-}
+        dst=''; mode=rw
+        # Same-path is the common case and the default, because a tool
+        # configured on the host refers to itself by absolute path: an MCP
+        # server registered as /root/.vault/x/server.js has to be at that exact
+        # path inside the container too, or the config that came with the
+        # credentials points at nothing.
+        case ${#parts[@]} in
+            1) dst=$src ;;
+            2) case "${parts[1]}" in
+                   ro|rw) dst=$src; mode=${parts[1]} ;;
+                   *)     dst=${parts[1]} ;;
+               esac ;;
+            *) dst=${parts[1]}; mode=${parts[2]} ;;
+        esac
+        if [[ -z "$src" || "$dst" != /* || ( "$mode" != ro && "$mode" != rw ) ]]; then
+            warn "WK_MOUNTS: cannot read '$entry' (want source[:/target][:ro])"
+            continue
+        fi
+        if [[ ! -e "$src" ]]; then
+            warn "WK_MOUNTS: $src is not on this host — skipping"
+            continue
+        fi
+        dev="wk-m-$(printf '%s' "${dst#/}" | tr -c 'a-zA-Z0-9' '-' | cut -c1-40)"
+        lxc_ config device get "$name" "$dev" source >/dev/null 2>&1 && continue
+        args=(source="$src" path="$dst")
+        [[ "$mode" == ro ]] && args+=(readonly=true)
+        if lxc_ config device add "$name" "$dev" disk "${args[@]}" >/dev/null 2>&1; then
+            step "mounted $src at $dst${mode:+ ($mode)}"
+        else
+            warn "could not mount $src at $dst in $name"
+        fi
+    done
+}
+
 warm_images() {
     local name=$1
     [[ -n "$WK_WARM_IMAGES" ]] || { step "WK_WARM_IMAGES is empty — skipping image warm-up"; return 0; }
@@ -1207,11 +1291,25 @@ warm_images() {
     wait_docker "$name" || die "Docker daemon is not up in $name"
     mkdir -p "$WK_IMAGE_CACHE"
 
+    local mounted=1
+    ensure_image_mount "$name" || { mounted=0; step "could not mount the image cache — copying tars in instead"; }
+
     local image tar_name tar_path
     # shellcheck disable=SC2086  # WK_WARM_IMAGES is a space-separated list
     for image in $WK_WARM_IMAGES; do
         tar_name="${image//\//_}"; tar_name="${tar_name//:/__}"; tar_name="${tar_name//@/_}.tar"
         tar_path="$WK_IMAGE_CACHE/$tar_name"
+
+        # Already loaded: nothing to do. A tar's contents do not change unless
+        # someone replaces the tar, so asking the container what it has is both
+        # cheaper and more truthful than hashing the file — it answers "is this
+        # image usable here", which is the actual question. Set
+        # WK_REFRESH_IMAGE_CACHE=1 to say a tar really was replaced.
+        if [[ "${WK_REFRESH_IMAGE_CACHE:-0}" != 1 ]] \
+           && lxc_ exec "$name" -- docker image inspect "$image" >/dev/null 2>&1; then
+            step "already in $name: $image"
+            continue
+        fi
 
         if [[ "${WK_REFRESH_IMAGE_CACHE:-0}" == 1 || ! -s "$tar_path" ]]; then
             if ! docker image inspect "$image" >/dev/null 2>&1; then
@@ -1223,9 +1321,13 @@ warm_images() {
         fi
 
         step "loading into $name: $image"
-        lxc_ file push "$tar_path" "$name/tmp/$tar_name" >/dev/null
-        lxc_ exec "$name" -- docker image load -i "/tmp/$tar_name" >/dev/null
-        lxc_ exec "$name" -- rm -f "/tmp/$tar_name"
+        if (( mounted )); then
+            lxc_ exec "$name" -- docker image load -i "$WK_IMAGE_MOUNT/$tar_name" >/dev/null
+        else
+            lxc_ file push "$tar_path" "$name/tmp/$tar_name" >/dev/null
+            lxc_ exec "$name" -- docker image load -i "/tmp/$tar_name" >/dev/null
+            lxc_ exec "$name" -- rm -f "/tmp/$tar_name"
+        fi
     done
 }
 
@@ -1338,6 +1440,8 @@ cmd_new() {
         seed_auth "$name"   || die "seeding credentials into $name failed"
         warm_images "$name" || die "warming images into $name failed"
     fi
+    ensure_mounts "$name"
+
     # `wk smoke` needs this to prove in-network DNS and uid-1000 write access.
     # A few MB, and fetching it now beats a smoke test that cannot run later.
     lxc_ exec "$name" -- bash -lc "docker image inspect $WK_PROBE_IMAGE >/dev/null 2>&1 \
@@ -1606,6 +1710,26 @@ cmd_stop() {
 }
 
 # --- Commands: auth / warm / services ----------------------------------------
+# Existing containers need a way to pick up a new WK_MOUNTS entry without being
+# rebuilt — the same reason `wk auth` exists for credentials.
+cmd_mount() {
+    local name=${1:-} count=0
+    if [[ -n "$name" ]]; then
+        require_slot "$name"
+        lock_slot "$name" x
+        ensure_mounts "$name"
+        audit "mount $name"
+        return 0
+    fi
+    [[ -n "$WK_MOUNTS" ]] || { warn "WK_MOUNTS is empty — nothing to mount"; return 0; }
+    while read -r name; do
+        [[ -n "$name" ]] || continue
+        ensure_mounts "$name"
+        count=$(( count + 1 ))
+    done < <(managed_slots)
+    (( count )) || warn "no containers to mount into"
+}
+
 cmd_auth() {
     local name=${1:-} count=0
     if [[ -n "$name" ]]; then
@@ -2187,6 +2311,7 @@ Setup (rare):
   wk rm [-f] <c>               delete a container (never touches your code)
   wk doctor [--fix]            check LXD, proxy egress, memory, container config
   wk auth [c]                  re-seed credentials after logging in again on the host
+  wk mount [c]                 attach the WK_MOUNTS host directories (existing containers)
 
 Troubleshooting:
   wk exec [--retry N] <c> <cmd...>
@@ -2202,6 +2327,7 @@ Troubleshooting:
 Config: $WK_CONFIG (shell vars; environment overrides)
   WK_POOL WK_DATA_ROOT WK_IMAGE WK_SLOTS WK_WARM_IMAGES WK_NETWORKS
   WK_CODE_UID WK_CODE_GID WK_MEM_SAFETY WK_PROXY WK_NO_PROXY WK_PROBE_IMAGE
+  WK_SEED_PATHS (copied per container)   WK_MOUNTS (shared from the host)
 
 Note: containers are privileged (required for nested Docker). Treat them as a
 trusted local environment, not as a multi-tenant security boundary.
@@ -2224,6 +2350,7 @@ main() {
         rm|delete)      cmd_rm "$@" ;;
         doctor)         cmd_doctor "$@" ;;
         auth)           cmd_auth "$@" ;;
+        mount)          cmd_mount "$@" ;;
         exec)           cmd_exec "$@" ;;
         dexec)          cmd_dexec "$@" ;;
         up)             cmd_up "$@" ;;
