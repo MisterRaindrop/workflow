@@ -149,8 +149,23 @@ lock_slot() {
     { exec 9>"$dir/$name.lock"; } 2>/dev/null || return 0
 
     flock "-$mode" -w "$WK_LOCK_WAIT" 9 2>/dev/null && return 0
-    die "$name is busy: another wk operation holds the lock (waited ${WK_LOCK_WAIT}s).
-     See what is running with: wk ls   —   lock file: $dir/$name.lock"
+
+    # Naming the holder turns this from a dead end into an answer. It is usually
+    # a long operation that outlived the terminal that started it — an ssh
+    # session killed mid-`wk up` leaves the command running on the host, still
+    # holding the lock. fd 9 is where lock_slot puts it, so /proc finds it
+    # without needing lsof or fuser installed.
+    local held='' fd
+    for fd in /proc/[0-9]*/fd/9; do
+        [[ "$(readlink -f "$fd" 2>/dev/null)" == "$dir/$name.lock" ]] || continue
+        local pid=${fd#/proc/}; pid=${pid%%/*}
+        held="$held
+       pid $pid: $(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-80)"
+    done
+
+    die "$name is busy: another wk operation holds the lock (waited ${WK_LOCK_WAIT}s).${held:+
+     held by:$held}
+     lock file: $dir/$name.lock   —   containers: wk ls"
 }
 
 # --- Pure helpers (unit-tested) -----------------------------------------------
@@ -852,6 +867,60 @@ apply_slot_config() {
     return 0
 }
 
+# Wiring the proxy into Docker is a separate job from installing it, and tying
+# the two together means a container that already has Docker never gets the
+# configuration. Measured: three containers whose Docker arrived from a retried
+# or hand-run install had no /root/.docker/config.json at all, so `docker run`
+# passed no proxy to anything it started. This project's conan packages come
+# from an internal host and did not notice; anything reaching the public
+# internet from inside a build container would have failed.
+#
+# Always run it, whether Docker was just installed or was already there.
+configure_docker_proxy() {
+    local name=$1
+    [[ -n "$WK_PROXY" ]] || return 0
+    lxc_ exec "$name" -- bash -s "$WK_PROXY" "$WK_NO_PROXY" <<'GUEST'
+set -Eeuo pipefail
+trap 'echo "guest step failed: $BASH_COMMAND (line $LINENO)" >&2' ERR
+proxy=$1; noproxy=$2
+
+# The daemon needs it for `docker pull`.
+install -d /etc/systemd/system/docker.service.d
+{
+    echo "[Service]"
+    for var in HTTP_PROXY HTTPS_PROXY http_proxy https_proxy; do
+        printf 'Environment="%s=%s"\n' "$var" "$proxy"
+    done
+    for var in NO_PROXY no_proxy; do
+        printf 'Environment="%s=%s"\n' "$var" "$noproxy"
+    done
+} > /etc/systemd/system/docker.service.d/proxy.conf
+
+# The CLI injects these into every container it creates, which is the only way
+# a build gets its public downloads when the project's Makefile passes nothing.
+#
+# noProxy stays minimal on purpose: the slot's own NO_PROXY excludes the private
+# ranges, but the internal registry and artifact repo live on one of those and
+# are only reachable *through* the proxy. Service hostnames are added to this
+# list by `wk up`, which knows what a group declares.
+install -d /root/.docker
+cat > /root/.docker/config.json <<JSON
+{
+  "proxies": {
+    "default": {
+      "httpProxy": "$proxy",
+      "httpsProxy": "$proxy",
+      "noProxy": "localhost,127.0.0.1,::1"
+    }
+  }
+}
+JSON
+
+systemctl daemon-reload
+systemctl restart docker
+GUEST
+}
+
 install_docker() {
     local name=$1
     info "installing Docker in $name"
@@ -927,40 +996,6 @@ else
     exit 1
 fi
 retry apt-get install -y docker.io "$compose_pkg" git openssh-client ca-certificates curl jq tmux
-
-if [[ -n "$proxy" ]]; then
-    install -d /etc/systemd/system/docker.service.d
-    {
-        echo "[Service]"
-        for var in HTTP_PROXY HTTPS_PROXY NO_PROXY http_proxy https_proxy no_proxy; do
-            val="${!var:-}"
-            [[ -n "$val" ]] || continue
-            val="${val//\\/\\\\}"; val="${val//\"/\\\"}"
-            printf 'Environment="%s=%s"\n' "$var" "$val"
-        done
-    } > /etc/systemd/system/docker.service.d/proxy.conf
-
-    # Docker CLI injects these into every `docker run`, which is the only way a
-    # build container gets a proxy when the project's Makefile does not pass one
-    # (a project's build rule typically does not). Without it, anything the build
-    # downloads — conan packages, for instance — cannot leave the container.
-    #
-    # noProxy here is deliberately minimal: the slot's own NO_PROXY excludes
-    # private ranges, but the internal registry and artifact repo live on one of
-    # those ranges and are only reachable *through* the proxy.
-    install -d /root/.docker
-    cat > /root/.docker/config.json <<JSON
-{
-  "proxies": {
-    "default": {
-      "httpProxy": "$proxy",
-      "httpsProxy": "$proxy",
-      "noProxy": "localhost,127.0.0.1,::1"
-    }
-  }
-}
-JSON
-fi
 
 systemctl daemon-reload
 systemctl enable --now docker
@@ -1426,6 +1461,11 @@ clone_slot() {
     step "waiting for the Docker daemon"
     wait_docker "$name" || warn "Docker did not come up in $name — check: wk exec $name 'journalctl -u docker -n 50'"
 
+    # A clone inherits the source's Docker configuration, which may predate the
+    # current proxy — and may be missing entirely if the source got Docker some
+    # way other than a clean install.
+    configure_docker_proxy "$name" || warn "could not configure Docker's proxy in $name"
+
     # The host's credentials may have been refreshed since the source was built.
     seed_auth "$name" || warn "could not re-seed credentials into $name"
     touch_active "$name"
@@ -1473,6 +1513,8 @@ cmd_new() {
         else
             step "Docker already present"
         fi
+        configure_docker_proxy "$name" \
+            || warn "could not configure Docker's proxy in $name — builds may not reach the public internet"
         install_tools "$name" \
             || die "installing tools in $name failed — see the guest error above; wk new is idempotent, re-run it to continue"
         seed_auth "$name"   || die "seeding credentials into $name failed"
@@ -1755,14 +1797,17 @@ cmd_mount() {
     if [[ -n "$name" ]]; then
         require_slot "$name"
         lock_slot "$name" x
+        ensure_image_mount "$name" || true
         ensure_mounts "$name"
+        configure_docker_proxy "$name" || warn "could not configure Docker's proxy in $name"
         audit "mount $name"
         return 0
     fi
-    [[ -n "$WK_MOUNTS" ]] || { warn "WK_MOUNTS is empty — nothing to mount"; return 0; }
     while read -r name; do
         [[ -n "$name" ]] || continue
+        ensure_image_mount "$name" || true
         ensure_mounts "$name"
+        configure_docker_proxy "$name" || warn "could not configure Docker's proxy in $name"
         count=$(( count + 1 ))
     done < <(managed_slots)
     (( count )) || warn "no containers to mount into"
@@ -1824,7 +1869,10 @@ cmd_cache() {
 # regenerable accelerator, never the only copy of anything — so LRU is safe.
 cache_prune() {
     [[ -d "$WK_IMAGE_CACHE" ]] || return 0
-    local max=$(( WK_CACHE_MAX_GB * 1024 * 1024 * 1024 ))
+    # WK_CACHE_MAX_BYTES exists for the cases GB cannot express — a tighter
+    # budget on a small disk, and a test that should not have to create
+    # gigabyte-sized fixtures to exercise this.
+    local max=${WK_CACHE_MAX_BYTES:-$(( WK_CACHE_MAX_GB * 1024 * 1024 * 1024 ))}
     local listing running=0 atime size path freed=0
     listing="$(
         for path in "$WK_IMAGE_CACHE"/*.tar; do
@@ -1836,10 +1884,17 @@ cache_prune() {
 
     while read -r atime size path; do
         [[ -n "${path:-}" ]] || continue
-        running=$(( running + size ))
-        if (( running > max )); then
+        # Decide on the running total *plus* this file, and only count what is
+        # kept. Adding first and testing after lets one oversized entry poison
+        # the total: everything behind it is then over the limit too and gets
+        # deleted regardless of size. Measured — a 12.4G tar at the head of the
+        # list (most recently read, so first) against a 6G limit emptied a
+        # 19.4G cache down to nothing.
+        if (( running + size > max )); then
             step "pruning $(basename "$path") ($(fmt_bytes "$size"))"
             rm -f "$path" && freed=$(( freed + size ))
+        else
+            running=$(( running + size ))
         fi
     done <<< "$listing"
 
@@ -2366,6 +2421,7 @@ Config: $WK_CONFIG (shell vars; environment overrides)
   WK_POOL WK_DATA_ROOT WK_IMAGE WK_SLOTS WK_WARM_IMAGES WK_NETWORKS
   WK_CODE_UID WK_CODE_GID WK_MEM_SAFETY WK_PROXY WK_NO_PROXY WK_PROBE_IMAGE
   WK_SEED_PATHS (copied per container)   WK_MOUNTS (shared from the host)
+  WK_CACHE_MAX_GB / WK_CACHE_MAX_BYTES
 
 Note: containers are privileged (required for nested Docker). Treat them as a
 trusted local environment, not as a multi-tenant security boundary.

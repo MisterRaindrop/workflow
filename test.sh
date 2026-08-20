@@ -447,6 +447,31 @@ assert_match "an image already there is skipped" "already in lxslot1" "$out"
 assert_not_called "…nothing is loaded again"     "docker image load"
 
 echo ""
+echo "=== Docker's proxy is configured whether or not Docker was just installed ==="
+# Installing Docker and wiring its proxy are separate jobs. Tied together, a
+# container that already had Docker never got /root/.docker/config.json, so
+# `docker run` passed no proxy to anything it started.
+(
+  export WK_PROXY="http://10.0.0.1:1080"
+  wk_run new lxslot8 --from lxslot1 >/dev/null 2>&1
+)
+assert_called "a clone gets it too"              "exec lxslot8 -- bash -s http://10.0.0.1:1080"
+# And every container, when run without a name — the loop is the form actually
+# used to bring an existing fleet up to date.
+(
+  export WK_PROXY="http://10.0.0.1:1080"
+  wk_run mount >/dev/null 2>&1
+)
+assert_called "…and so does each of a fleet"     "exec lxslot3 -- bash -s http://10.0.0.1:1080"
+(
+  # Unset, not empty: wk falls back through HTTPS_PROXY/HTTP_PROXY, so an empty
+  # WK_PROXY does not mean "no proxy" if the environment has one.
+  unset WK_PROXY HTTPS_PROXY HTTP_PROXY https_proxy http_proxy
+  wk_run mount lxslot1 >/dev/null 2>&1
+)
+assert_not_called "…and nothing to do without a proxy" "bash -s http"
+
+echo ""
 echo "=== new --from: clone instead of provision ==="
 # Cloning replaces ~26 minutes of apt and image loading with a copy. What must
 # not be inherited is the source's identity or its bound checkout.
@@ -598,7 +623,23 @@ assert_match "…and reports a total"                 "total"          "$out"
 export WK_CACHE_MAX_GB=0
 wk_run cache prune >/dev/null
 assert_eq "prune trims to the limit"                "0" "$(ls "$CACHE"/*.tar 2>/dev/null | wc -l | tr -d ' ')"
-unset WK_CACHE_MAX_GB WK_IMAGE_CACHE
+
+# One entry larger than the whole limit must not take the rest with it. The
+# limit is per-cache, not per-file, and the biggest tar is often the most
+# recently read — so it sorts first and, with a naive running total, deletes
+# everything behind it. Measured on a real cache: a 12.4G tar against a 6G
+# limit emptied 19.4G down to nothing.
+rm -f "$CACHE"/*.tar
+dd if=/dev/zero of="$CACHE/huge.tar" bs=1024 count=3000 2>/dev/null
+printf 'x' > "$CACHE/small1.tar"
+printf 'x' > "$CACHE/small2.tar"
+touch -a -t 203001010000 "$CACHE/huge.tar"      # most recently used, so it sorts first
+out="$(WK_CACHE_MAX_BYTES=$((1024 * 1024)) wk_run cache prune 2>&1)"
+assert_eq "an oversized entry does not take the rest" "2" \
+          "$(ls "$CACHE"/small*.tar 2>/dev/null | wc -l | tr -d ' ')"
+assert_eq "…and it is the one that goes"             "0" \
+          "$(ls "$CACHE"/huge.tar 2>/dev/null | wc -l | tr -d ' ')"
+unset WK_IMAGE_CACHE
 
 echo ""
 echo "=== warm --from (cross-container copy) ==="
