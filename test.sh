@@ -24,6 +24,13 @@ assert_match() {
     else fail "$desc" "a match for /$pattern/" "$(tr '\n' '|' <<<"$actual" | cut -c1-160)"; fi
 }
 
+assert_no_match() {
+    local desc=$1 pattern=$2 actual=$3
+    if grep -qE -- "$pattern" <<<"$actual"; then
+        fail "$desc" "no match for /$pattern/" "$(tr '\n' '|' <<<"$actual" | cut -c1-160)"
+    else pass "$desc"; fi
+}
+
 assert_ok() {
     local desc=$1; shift
     if "$@" >/dev/null 2>&1; then pass "$desc"; else fail "$desc" "exit 0" "exit $?"; fi
@@ -183,6 +190,13 @@ wk_run() {
         # default, or a case-specific directory. Never wk's real defaults.
         export WK_DATA_ROOT WK_IMAGE_CACHE
         export WK_TMUX=0
+        # The human `ls` table sizes its CODE column to the terminal, so an
+        # unpinned width makes assertions about elision depend on whoever runs
+        # them: an interactive shell here reports COLUMNS=0 (wk floors the
+        # budget at 20, so everything elides), while CI has no tty at all and
+        # `tput cols` then answers 100 (so a 60-char path fits and nothing
+        # elides). Same code, opposite results. Pin it; cases that care override.
+        export COLUMNS="${WK_TEST_COLUMNS:-80}"
         # </dev/null: the fake lxc drains piped stdin (like the real client), so
         # wk must never inherit the harness's stdin — a held-open one hangs it.
         bash "$WK" "$@" </dev/null
@@ -310,7 +324,12 @@ export WK_FAKE_BOUND="lxslot1=/mnt/data500/a-very-long-directory-name/nested/dee
 assert_eq "long paths are not truncated" \
     "/mnt/data500/a-very-long-directory-name/nested/deeper/project" \
     "$(wk_run ls --porcelain | head -1 | cut -f5)"
+# At 80 columns a 60-char path cannot fit, so it must lose its middle…
 assert_match "…while the human table does elide them" "\.\.\." "$(wk_run ls)"
+# …and given room it must arrive whole. Asserting only the first direction is
+# how this slipped through: it passes on any terminal that happens to be narrow.
+assert_no_match "…and leaves it whole when there is room" "\.\.\." \
+    "$(WK_TEST_COLUMNS=200 wk_run ls)"
 export WK_FAKE_BOUND="lxslot1=/data/alpha lxslot2=/data/beta"
 
 echo ""
